@@ -65,6 +65,10 @@ export interface UsageSnapshot {
 export interface UsageOverviewSummary {
   request_count: number
   token_count: number
+  fresh_input_tokens: number
+  output_tokens: number
+  real_total_tokens: number
+  cache_hit_rate: number
   window_minutes: number
   rpm: number
   tpm: number

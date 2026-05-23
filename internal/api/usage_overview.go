@@ -35,15 +35,19 @@ type usageOverviewPayload struct {
 }
 
 type usageOverviewSummary struct {
-	RequestCount    int64   `json:"request_count"`
-	TokenCount      int64   `json:"token_count"`
-	WindowMinutes   int64   `json:"window_minutes"`
-	RPM             float64 `json:"rpm"`
-	TPM             float64 `json:"tpm"`
-	TotalCost       float64 `json:"total_cost"`
-	CostAvailable   bool    `json:"cost_available"`
-	CachedTokens    int64   `json:"cached_tokens"`
-	ReasoningTokens int64   `json:"reasoning_tokens"`
+	RequestCount     int64   `json:"request_count"`
+	TokenCount       int64   `json:"token_count"`
+	FreshInputTokens int64   `json:"fresh_input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	RealTotalTokens  int64   `json:"real_total_tokens"`
+	CacheHitRate     float64 `json:"cache_hit_rate"`
+	WindowMinutes    int64   `json:"window_minutes"`
+	RPM              float64 `json:"rpm"`
+	TPM              float64 `json:"tpm"`
+	TotalCost        float64 `json:"total_cost"`
+	CostAvailable    bool    `json:"cost_available"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	ReasoningTokens  int64   `json:"reasoning_tokens"`
 }
 
 type usageOverviewSeries struct {
@@ -204,15 +208,19 @@ func buildUsageOverviewSummary(overview *service.UsageOverviewSnapshot) usageOve
 		return usageOverviewSummary{}
 	}
 	return usageOverviewSummary{
-		RequestCount:    overview.Summary.RequestCount,
-		TokenCount:      overview.Summary.TokenCount,
-		WindowMinutes:   overview.Summary.WindowMinutes,
-		RPM:             overview.Summary.RPM,
-		TPM:             overview.Summary.TPM,
-		TotalCost:       overview.Summary.TotalCost,
-		CostAvailable:   overview.Summary.CostAvailable,
-		CachedTokens:    overview.Summary.CachedTokens,
-		ReasoningTokens: overview.Summary.ReasoningTokens,
+		RequestCount:     overview.Summary.RequestCount,
+		TokenCount:       overview.Summary.TokenCount,
+		FreshInputTokens: overview.Summary.FreshInputTokens,
+		OutputTokens:     overview.Summary.OutputTokens,
+		RealTotalTokens:  overview.Summary.RealTotalTokens,
+		CacheHitRate:     overview.Summary.CacheHitRate,
+		WindowMinutes:    overview.Summary.WindowMinutes,
+		RPM:              overview.Summary.RPM,
+		TPM:              overview.Summary.TPM,
+		TotalCost:        overview.Summary.TotalCost,
+		CostAvailable:    overview.Summary.CostAvailable,
+		CachedTokens:     overview.Summary.CachedTokens,
+		ReasoningTokens:  overview.Summary.ReasoningTokens,
 	}
 }
 

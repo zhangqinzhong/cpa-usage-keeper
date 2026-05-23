@@ -110,6 +110,12 @@ func TestBuildUsageOverviewWithFilterComputesSummaryAndSeries(t *testing.T) {
 	if overview.Summary.CachedTokens != 350 || overview.Summary.ReasoningTokens != 175 {
 		t.Fatalf("unexpected summary token breakdown: %+v", overview.Summary)
 	}
+	if overview.Summary.FreshInputTokens != 3150 || overview.Summary.OutputTokens != 1750 || overview.Summary.RealTotalTokens != 5250 {
+		t.Fatalf("unexpected real token counters: %+v", overview.Summary)
+	}
+	if math.Abs(overview.Summary.CacheHitRate-(350.0/3500.0)) > 0.000000001 {
+		t.Fatalf("unexpected cache hit rate: %+v", overview.Summary)
+	}
 	if overview.Summary.WindowMinutes != 2880 {
 		t.Fatalf("expected 2880 minute window, got %+v", overview.Summary)
 	}

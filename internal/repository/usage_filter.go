@@ -89,15 +89,19 @@ type UsageAnalysisAPIStatRecord struct {
 }
 
 type UsageOverviewSummaryRecord struct {
-	RequestCount    int64
-	TokenCount      int64
-	WindowMinutes   int64
-	RPM             float64
-	TPM             float64
-	TotalCost       float64
-	CostAvailable   bool
-	CachedTokens    int64
-	ReasoningTokens int64
+	RequestCount     int64
+	TokenCount       int64
+	FreshInputTokens int64
+	OutputTokens     int64
+	RealTotalTokens  int64
+	CacheHitRate     float64
+	WindowMinutes    int64
+	RPM              float64
+	TPM              float64
+	TotalCost        float64
+	CostAvailable    bool
+	CachedTokens     int64
+	ReasoningTokens  int64
 }
 
 type UsageOverviewSeriesRecord struct {

@@ -2,6 +2,7 @@ import { useMemo, type CSSProperties, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Line } from 'react-chartjs-2';
 import {
+  IconBot,
   IconDiamond,
   IconDollarSign,
   IconSatellite,
@@ -43,7 +44,14 @@ export interface StatCardsProps {
 }
 
 interface StatCardMetrics {
-  tokenBreakdown: { cachedTokens: number; reasoningTokens: number };
+  tokenBreakdown: {
+    cachedTokens: number;
+    reasoningTokens: number;
+    freshInputTokens: number;
+    outputTokens: number;
+    realTotalTokens: number;
+    cacheHitRate: number;
+  };
   rateStats: { rpm: number; tpm: number; windowMinutes: number; requestCount: number; tokenCount: number };
   totalCost: number;
   costAvailable: boolean;
@@ -52,7 +60,14 @@ interface StatCardMetrics {
 export function buildStatCardMetrics({ usage }: { usage: UsageOverviewPayload | null }): StatCardMetrics {
   if (!usage?.summary) {
     return {
-      tokenBreakdown: { cachedTokens: 0, reasoningTokens: 0 },
+      tokenBreakdown: {
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        freshInputTokens: 0,
+        outputTokens: 0,
+        realTotalTokens: 0,
+        cacheHitRate: 0,
+      },
       rateStats: { rpm: 0, tpm: 0, windowMinutes: 1, requestCount: 0, tokenCount: 0 },
       totalCost: 0,
       costAvailable: false,
@@ -63,6 +78,10 @@ export function buildStatCardMetrics({ usage }: { usage: UsageOverviewPayload | 
     tokenBreakdown: {
       cachedTokens: usage.summary.cached_tokens ?? 0,
       reasoningTokens: usage.summary.reasoning_tokens ?? 0,
+      freshInputTokens: usage.summary.fresh_input_tokens ?? 0,
+      outputTokens: usage.summary.output_tokens ?? 0,
+      realTotalTokens: usage.summary.real_total_tokens ?? 0,
+      cacheHitRate: usage.summary.cache_hit_rate ?? 0,
     },
     rateStats: {
       rpm: usage.summary.rpm ?? 0,
@@ -83,6 +102,7 @@ export function StatCards({ usage, loading, sparklines }: StatCardsProps) {
     () => buildStatCardMetrics({ usage }),
     [usage]
   );
+  const cacheHitRateLabel = loading ? '-' : `${(Math.max(tokenBreakdown.cacheHitRate, 0) * 100).toFixed(1)}%`;
 
   const statsCards: StatCardData[] = [
     {
@@ -124,6 +144,31 @@ export function StatCards({ usage, loading, sparklines }: StatCardsProps) {
           <span className={styles.statMetaItem}>
             {t('usage_stats.reasoning_tokens')}:{' '}
             {loading ? '-' : formatCompactNumber(tokenBreakdown.reasoningTokens)}
+          </span>
+        </>
+      ),
+      trend: sparklines.tokens,
+    },
+    {
+      key: 'real-tokens',
+      label: t('usage_stats.real_total_tokens'),
+      icon: <IconBot size={16} />,
+      accent: '#06b6d4',
+      accentSoft: 'rgba(6, 182, 212, 0.16)',
+      accentBorder: 'rgba(6, 182, 212, 0.34)',
+      value: loading ? '-' : formatCompactNumber(tokenBreakdown.realTotalTokens),
+      meta: (
+        <>
+          <span className={styles.statMetaItem}>
+            {t('usage_stats.fresh_input_tokens')}:{' '}
+            {loading ? '-' : formatCompactNumber(tokenBreakdown.freshInputTokens)}
+          </span>
+          <span className={styles.statMetaItem}>
+            {t('usage_stats.output_token_count')}:{' '}
+            {loading ? '-' : formatCompactNumber(tokenBreakdown.outputTokens)}
+          </span>
+          <span className={styles.statMetaItem}>
+            {t('usage_stats.cache_hit_rate')}: {cacheHitRateLabel}
           </span>
         </>
       ),

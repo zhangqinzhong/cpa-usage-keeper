@@ -494,6 +494,24 @@ func applyUsageEventToOverviewSeries(series *UsageOverviewSeriesRecord, event mo
 }
 
 func applyUsageEventToOverview(overview *UsageOverviewRecord, event models.UsageEvent, bucketByDay bool, latestHourlyStart *time.Time, pricingByModel map[string]models.ModelPriceSetting) {
+	inputTokens := event.InputTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	outputTokens := event.OutputTokens
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	cachedTokens := event.CachedTokens
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	freshInputTokens := inputTokens - cachedTokens
+	if freshInputTokens < 0 {
+		freshInputTokens = 0
+	}
+	overview.Summary.FreshInputTokens += freshInputTokens
+	overview.Summary.OutputTokens += outputTokens
 	overview.Summary.CachedTokens += event.CachedTokens
 	overview.Summary.ReasoningTokens += event.ReasoningTokens
 	if event.Failed {
@@ -525,6 +543,11 @@ func finalizeUsageOverview(overview *UsageOverviewRecord, includeDetails bool) {
 	finalizeUsageSnapshot(overview.Usage, includeDetails)
 	overview.Summary.RequestCount = overview.Usage.TotalRequests
 	overview.Summary.TokenCount = overview.Usage.TotalTokens
+	overview.Summary.RealTotalTokens = overview.Summary.FreshInputTokens + overview.Summary.OutputTokens + overview.Summary.CachedTokens
+	cacheableInput := overview.Summary.FreshInputTokens + overview.Summary.CachedTokens
+	if cacheableInput > 0 {
+		overview.Summary.CacheHitRate = float64(overview.Summary.CachedTokens) / float64(cacheableInput)
+	}
 	if overview.Summary.WindowMinutes > 0 {
 		overview.Summary.RPM = float64(overview.Summary.RequestCount) / float64(overview.Summary.WindowMinutes)
 		overview.Summary.TPM = float64(overview.Summary.TokenCount) / float64(overview.Summary.WindowMinutes)

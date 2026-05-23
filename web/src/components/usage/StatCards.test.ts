@@ -51,6 +51,10 @@ const usageWithBackendSummary: UsagePayload = {
     tpm: 6.475,
     total_cost: 1.234,
     cost_available: true,
+    fresh_input_tokens: 55,
+    output_tokens: 66,
+    real_total_tokens: 143,
+    cache_hit_rate: 22 / 77,
     cached_tokens: 22,
     reasoning_tokens: 33,
   },
@@ -69,6 +73,10 @@ describe('buildStatCardMetrics', () => {
     expect(metrics.rateStats.tpm).toBe(6.475);
     expect(metrics.tokenBreakdown.cachedTokens).toBe(22);
     expect(metrics.tokenBreakdown.reasoningTokens).toBe(33);
+    expect(metrics.tokenBreakdown.freshInputTokens).toBe(55);
+    expect(metrics.tokenBreakdown.outputTokens).toBe(66);
+    expect(metrics.tokenBreakdown.realTotalTokens).toBe(143);
+    expect(metrics.tokenBreakdown.cacheHitRate).toBe(22 / 77);
     expect(metrics.totalCost).toBe(1.234);
   });
 

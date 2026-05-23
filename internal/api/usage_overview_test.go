@@ -113,15 +113,19 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 			},
 		},
 		Summary: service.UsageOverviewSummary{
-			RequestCount:    1,
-			TokenCount:      20,
-			WindowMinutes:   1440,
-			RPM:             1.0 / 1440.0,
-			TPM:             20.0 / 1440.0,
-			TotalCost:       0.123,
-			CostAvailable:   true,
-			CachedTokens:    2,
-			ReasoningTokens: 3,
+			RequestCount:     1,
+			TokenCount:       20,
+			FreshInputTokens: 9,
+			OutputTokens:     7,
+			RealTotalTokens:  18,
+			CacheHitRate:     2.0 / 11.0,
+			WindowMinutes:    1440,
+			RPM:              1.0 / 1440.0,
+			TPM:              20.0 / 1440.0,
+			TotalCost:        0.123,
+			CostAvailable:    true,
+			CachedTokens:     2,
+			ReasoningTokens:  3,
 		},
 		Series: service.UsageOverviewSeries{
 			Requests:        map[string]int64{"2026-04-22T11:00:00Z": 1},
@@ -162,6 +166,12 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 	}
 	if !contains(body, `"summary":{"request_count":1,"token_count":20`) {
 		t.Fatalf("expected backend summary in response body: %s", body)
+	}
+	if !contains(body, `"fresh_input_tokens":9`) ||
+		!contains(body, `"output_tokens":7`) ||
+		!contains(body, `"real_total_tokens":18`) ||
+		!contains(body, `"cache_hit_rate":0.18181818181818182`) {
+		t.Fatalf("expected real token counters in response body: %s", body)
 	}
 	if !contains(body, `"cost_available":true`) {
 		t.Fatalf("expected backend cost availability in response body: %s", body)
