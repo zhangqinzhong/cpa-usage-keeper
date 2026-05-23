@@ -1049,7 +1049,7 @@ func applyUsageOverviewHourlyStatToOverview(overview *dto.UsageOverviewRecord, r
 	if _, ok := pricingByModel[strings.TrimSpace(row.Model)]; !ok && usageOverviewStatRequiresPricing(row.InputTokens, row.OutputTokens, row.CachedTokens) {
 		overview.Summary.CostAvailable = false
 	}
-	applyUsageOverviewStatToSummary(overview, row.RequestCount, row.CachedTokens, row.ReasoningTokens, rowCost)
+	applyUsageOverviewStatToSummary(overview, row.RequestCount, row.InputTokens, row.OutputTokens, row.CachedTokens, row.ReasoningTokens, rowCost)
 
 	// 主序列按当前窗口选择小时或天粒度。
 	bucketKey, bucketMinutes := usageOverviewBucket(timeutil.NormalizeStorageTime(row.BucketStart), bucketByDay)
@@ -1082,7 +1082,7 @@ func applyUsageOverviewDailyStatToOverview(overview *dto.UsageOverviewRecord, ro
 	if _, ok := pricingByModel[strings.TrimSpace(row.Model)]; !ok && usageOverviewStatRequiresPricing(row.InputTokens, row.OutputTokens, row.CachedTokens) {
 		overview.Summary.CostAvailable = false
 	}
-	applyUsageOverviewStatToSummary(overview, row.RequestCount, row.CachedTokens, row.ReasoningTokens, rowCost)
+	applyUsageOverviewStatToSummary(overview, row.RequestCount, row.InputTokens, row.OutputTokens, row.CachedTokens, row.ReasoningTokens, rowCost)
 
 	bucketKey, bucketMinutes := usageOverviewBucket(timeutil.NormalizeStorageTime(row.BucketStart), bucketByDay)
 	applyUsageOverviewStatToSeries(&overview.Series, row.Model, row.RequestCount, row.InputTokens, row.OutputTokens, row.CachedTokens, row.ReasoningTokens, row.TotalTokens, rowCost, bucketKey, bucketMinutes)
@@ -1092,7 +1092,13 @@ func applyUsageOverviewDailyStatToOverview(overview *dto.UsageOverviewRecord, ro
 }
 
 // applyUsageOverviewStatToSummary 写入 summary 中不在 StatisticsSnapshot 里的 token/cost 字段。
-func applyUsageOverviewStatToSummary(overview *dto.UsageOverviewRecord, requestCount, cachedTokens, reasoningTokens int64, cost float64) {
+func applyUsageOverviewStatToSummary(overview *dto.UsageOverviewRecord, requestCount, inputTokens, outputTokens, cachedTokens, reasoningTokens int64, cost float64) {
+	freshInput := inputTokens - cachedTokens
+	if freshInput < 0 {
+		freshInput = 0
+	}
+	overview.Summary.FreshInputTokens += freshInput
+	overview.Summary.OutputTokens += outputTokens
 	overview.Summary.CachedTokens += cachedTokens
 	overview.Summary.ReasoningTokens += reasoningTokens
 	overview.Summary.TotalCost += cost
@@ -1485,6 +1491,12 @@ func usageEventRequiresPricing(event entities.UsageEvent) bool {
 
 // applyUsageEventToOverview 把边界 raw event 合并进 Overview，语义必须和 stats row 合并保持一致。
 func applyUsageEventToOverview(overview *dto.UsageOverviewRecord, event entities.UsageEvent, bucketByDay bool, latestHourlyStart *time.Time, pricingByModel map[string]entities.ModelPriceSetting) {
+	freshInput := event.InputTokens - event.CachedTokens
+	if freshInput < 0 {
+		freshInput = 0
+	}
+	overview.Summary.FreshInputTokens += freshInput
+	overview.Summary.OutputTokens += event.OutputTokens
 	overview.Summary.CachedTokens += event.CachedTokens
 	overview.Summary.ReasoningTokens += event.ReasoningTokens
 	if event.Failed {
@@ -1519,6 +1531,11 @@ func finalizeUsageOverview(overview *dto.UsageOverviewRecord, includeDetails boo
 	finalizeUsageSnapshot(overview.Usage, includeDetails)
 	overview.Summary.RequestCount = overview.Usage.TotalRequests
 	overview.Summary.TokenCount = overview.Usage.TotalTokens
+	overview.Summary.RealTotalTokens = overview.Summary.FreshInputTokens + overview.Summary.OutputTokens + overview.Summary.CachedTokens
+	cacheableInput := overview.Summary.FreshInputTokens + overview.Summary.CachedTokens
+	if cacheableInput > 0 {
+		overview.Summary.CacheHitRate = float64(overview.Summary.CachedTokens) / float64(cacheableInput)
+	}
 	if overview.Summary.WindowMinutes > 0 {
 		overview.Summary.RPM = float64(overview.Summary.RequestCount) / float64(overview.Summary.WindowMinutes)
 		overview.Summary.TPM = float64(overview.Summary.TokenCount) / float64(overview.Summary.WindowMinutes)
