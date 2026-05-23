@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchUsageEventFilterOptions, fetchUsageEvents, triggerSync } from './api';
+import { appPath, fetchAnalysis, fetchCpaApiKeyOptions, fetchCpaApiKeys, fetchKeyOverview, fetchUsageOverview, fetchUsageQuotaCache, fetchUpdateCheck, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents, fetchUsageIdentities, fetchUsageIdentitiesPage, fetchUsageQuotaRefreshTask, loginWithCPAAPIKey, logout, refreshUsageQuotas, updateCpaApiKeyAlias } from './api';
 
 describe('fetchUsageEvents', () => {
   afterEach(() => {
@@ -7,30 +7,106 @@ describe('fetchUsageEvents', () => {
     vi.unstubAllGlobals();
   });
 
-  it('loads stable filter options without event pagination or selected filters', async () => {
+  it('builds app paths from the configured base path', () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: '/keeper/' });
+
+    expect(appPath('/key-overview')).toBe('/keeper/key-overview');
+    expect(appPath('key-overview')).toBe('/keeper/key-overview');
+  });
+
+  it('posts CPA API key logins to the dedicated auth endpoint', async () => {
     vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,
-      json: async () => ({ models: ['claude-sonnet'], sources: [{ value: 'source-a', label: 'Provider A' }] }),
+      json: async () => ({}),
+    } as Response);
+
+    await loginWithCPAAPIKey('sk-cpa-viewer');
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(new URL(String(url), 'http://localhost').pathname).toBe('/api/v1/auth/api-key-login');
+    expect(init).toMatchObject({ credentials: 'include', method: 'POST' });
+    expect(init?.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(init?.body).toBe(JSON.stringify({ apiKey: 'sk-cpa-viewer' }));
+  });
+
+  it('loads key overview with only the viewer range query', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ usage: { total_requests: 0, success_count: 0, failure_count: 0, total_tokens: 0, requests_by_day: {}, requests_by_hour: {}, tokens_by_day: {}, tokens_by_hour: {}, apis: {} } }),
     } as Response);
     const signal = new AbortController().signal;
 
-    const response = await fetchUsageEventFilterOptions('custom', '2026-04-20T00:00:00Z', '2026-04-21T00:00:00Z', signal);
+    await fetchKeyOverview('8h', signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+    expect(parsed.pathname).toBe('/api/v1/key-overview');
+    expect(parsed.searchParams.get('range')).toBe('8h');
+    expect(parsed.searchParams.get('api_key_id')).toBeNull();
+    expect(parsed.searchParams.get('start')).toBeNull();
+    expect(parsed.searchParams.get('end')).toBeNull();
+    expect(init).toMatchObject({ credentials: 'include', signal });
+  });
+
+  it('posts logout to the auth endpoint', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+    } as Response);
+
+    await logout();
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(new URL(String(url), 'http://localhost').pathname).toBe('/api/v1/auth/logout');
+    expect(init).toMatchObject({ credentials: 'include', method: 'POST' });
+  });
+
+  it('loads model filter options without query params', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ models: ['claude-sonnet'] }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageEventModelFilterOptions(signal);
 
     const [url, init] = fetchMock.mock.calls[0];
     const parsed = new URL(String(url), 'http://localhost');
 
     expect(response.models).toEqual(['claude-sonnet']);
-    expect(parsed.pathname).toBe('/api/v1/usage/events/filters');
-    expect(parsed.searchParams.get('range')).toBe('custom');
-    expect(parsed.searchParams.get('start')).toBe('2026-04-20T00:00:00Z');
-    expect(parsed.searchParams.get('end')).toBe('2026-04-21T00:00:00Z');
+    expect(parsed.pathname).toBe('/api/v1/usage/events/filters/models');
+    expect(parsed.search).toBe('');
+    expect(parsed.searchParams.get('range')).toBeNull();
+    expect(parsed.searchParams.get('start')).toBeNull();
+    expect(parsed.searchParams.get('end')).toBeNull();
     expect(parsed.searchParams.get('page')).toBeNull();
     expect(parsed.searchParams.get('page_size')).toBeNull();
     expect(parsed.searchParams.get('model')).toBeNull();
     expect(parsed.searchParams.get('source')).toBeNull();
     expect(parsed.searchParams.get('result')).toBeNull();
-    expect(init).toMatchObject({ credentials: 'include', signal });
+    expect(init).toMatchObject({ credentials: 'include', signal, cache: 'no-store' });
+  });
+
+  it('loads source filter options without query params', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ sources: [{ value: 'source-a', label: 'Provider A' }] }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageEventSourceFilterOptions(signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.sources).toEqual([{ value: 'source-a', label: 'Provider A' }]);
+    expect(parsed.pathname).toBe('/api/v1/usage/events/filters/sources');
+    expect(parsed.search).toBe('');
+    expect(init).toMatchObject({ credentials: 'include', signal, cache: 'no-store' });
   });
 
   it('passes pagination and server-side filters as query params', async () => {
@@ -45,7 +121,7 @@ describe('fetchUsageEvents', () => {
       page: 3,
       pageSize: 100,
       model: 'claude-sonnet',
-      source: 'source-a',
+      source: 'authidx-source-a',
       result: 'failed',
     });
 
@@ -59,27 +135,304 @@ describe('fetchUsageEvents', () => {
     expect(parsed.searchParams.get('page')).toBe('3');
     expect(parsed.searchParams.get('page_size')).toBe('100');
     expect(parsed.searchParams.get('model')).toBe('claude-sonnet');
-    expect(parsed.searchParams.get('source')).toBe('source-a');
+    expect(parsed.searchParams.get('source')).toBe('authidx-source-a');
     expect(parsed.searchParams.get('result')).toBe('failed');
     expect(parsed.searchParams.get('auth_index')).toBeNull();
     expect(init).toMatchObject({ credentials: 'include', signal });
   });
 
-  it('posts to the manual sync endpoint', async () => {
+  it('passes API key id to overview and events requests', async () => {
     vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,
-      json: async () => ({ running: true, sync_running: false, last_status: 'completed' }),
+      json: async () => ({ usage: { total_requests: 0, success_count: 0, failure_count: 0, total_tokens: 0, requests_by_day: {}, requests_by_hour: {}, tokens_by_day: {}, tokens_by_hour: {}, apis: {} }, events: [], total_count: 0, page: 1, page_size: 100, total_pages: 0 }),
     } as Response);
     const signal = new AbortController().signal;
 
-    const response = await triggerSync(signal);
+    await fetchUsageOverview('24h', undefined, undefined, signal, '9007199254740993');
+    await fetchUsageEvents('24h', undefined, undefined, signal, { apiKeyId: '9007199254740993' });
+
+    const overviewUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
+    const eventsUrl = new URL(String(fetchMock.mock.calls[1][0]), 'http://localhost');
+
+    expect(overviewUrl.pathname).toBe('/api/v1/usage/overview');
+    expect(eventsUrl.pathname).toBe('/api/v1/usage/events');
+    expect(overviewUrl.searchParams.get('api_key_id')).toBe('9007199254740993');
+    expect(eventsUrl.searchParams.get('api_key_id')).toBe('9007199254740993');
+  });
+
+  it('omits empty API key id from usage requests', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ usage: { total_requests: 0, success_count: 0, failure_count: 0, total_tokens: 0, requests_by_day: {}, requests_by_hour: {}, tokens_by_day: {}, tokens_by_hour: {}, apis: {} }, events: [], total_count: 0, page: 1, page_size: 100, total_pages: 0 }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    await fetchUsageOverview('24h', undefined, undefined, signal, '  ');
+    await fetchUsageEvents('24h', undefined, undefined, signal, { apiKeyId: '' });
+
+    for (const call of fetchMock.mock.calls) {
+      expect(new URL(String(call[0]), 'http://localhost').searchParams.get('api_key_id')).toBeNull();
+    }
+  });
+
+  it('loads Analysis from the dedicated endpoint with API key filtering', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ granularity: 'hourly', timezone: 'UTC', token_usage: [], api_key_composition: [], model_composition: [], heatmap: { api_keys: [], models: [], cells: [] } }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    await fetchAnalysis('custom', '2026-04-20', '2026-04-21', signal, '9007199254740993');
+
+    const analysisUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
+
+    expect(analysisUrl.pathname).toBe('/api/v1/usage/analysis');
+    expect(analysisUrl.searchParams.get('range')).toBe('custom');
+    expect(analysisUrl.searchParams.get('start')).toBe('2026-04-20');
+    expect(analysisUrl.searchParams.get('end')).toBe('2026-04-21');
+    expect(analysisUrl.searchParams.get('api_key_id')).toBe('9007199254740993');
+  });
+
+  it('passes credential page filters and sorting as query params', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ identities: [], total_count: 0, page: 1, page_size: 10, total_pages: 0 }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    await fetchUsageIdentitiesPage(signal, {
+      authType: 1,
+      page: 2,
+      pageSize: 20,
+      activeOnly: true,
+      sort: 'priority',
+    });
 
     const [url, init] = fetchMock.mock.calls[0];
     const parsed = new URL(String(url), 'http://localhost');
 
-    expect(response.last_status).toBe('completed');
-    expect(parsed.pathname).toBe('/api/v1/sync');
+    expect(parsed.pathname).toBe('/api/v1/usage/identities/page');
+    expect(parsed.searchParams.get('auth_type')).toBe('1');
+    expect(parsed.searchParams.get('page')).toBe('2');
+    expect(parsed.searchParams.get('page_size')).toBe('20');
+    expect(parsed.searchParams.get('active_only')).toBe('true');
+    expect(parsed.searchParams.get('sort')).toBe('priority');
+    expect(init).toMatchObject({ credentials: 'include', signal });
+  });
+
+  it('loads unified usage identities without query params', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        identities: [
+          {
+            id: '1',
+            name: 'Claude primary',
+            auth_type: 2,
+            auth_type_name: 'apikey',
+            identity: 'sk-a***1234',
+            type: 'claude',
+            provider: 'anthropic',
+            total_requests: 3,
+            success_count: 2,
+            failure_count: 1,
+            input_tokens: 10,
+            output_tokens: 20,
+            reasoning_tokens: 0,
+            cached_tokens: 0,
+            total_tokens: 30,
+            last_aggregated_usage_event_id: '9',
+            is_deleted: false,
+            created_at: '2026-05-04T00:00:00Z',
+            updated_at: '2026-05-04T00:00:00Z',
+          },
+        ],
+      }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageIdentities(signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.identities[0].identity).toBe('sk-a***1234');
+    expect(response.identities[0].auth_type).toBe(2);
+    expect(typeof response.identities[0].auth_type).toBe('number');
+    expect(parsed.pathname).toBe('/api/v1/usage/identities');
+    expect(parsed.search).toBe('');
+    expect(init).toMatchObject({ credentials: 'include', signal });
+  });
+
+  it('loads CPA API key settings without exposing numeric ids', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ items: [{ id: '9007199254740993', keyAlias: '', displayKey: 'sk-*********123456', label: 'sk-*********123456', lastSyncedAt: null }] }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchCpaApiKeys(signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.items[0].id).toBe('9007199254740993');
+    expect(typeof response.items[0].id).toBe('string');
+    expect(parsed.pathname).toBe('/api/v1/usage/api-keys');
+    expect(init).toMatchObject({ credentials: 'include', signal, cache: 'no-store' });
+  });
+
+  it('loads CPA API key options and updates aliases', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ options: [{ id: '123', keyAlias: 'Main', displayKey: 'sk-*********123456', label: 'Main', lastSyncedAt: '2026-05-13T00:00:00Z' }] }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: '123', keyAlias: '', displayKey: 'sk-*********123456', label: 'sk-*********123456', lastSyncedAt: '2026-05-13T00:00:00Z' }),
+      } as Response);
+    const signal = new AbortController().signal;
+
+    const options = await fetchCpaApiKeyOptions(signal);
+    const updated = await updateCpaApiKeyAlias('123', '');
+
+    const [optionsUrl, optionsInit] = fetchMock.mock.calls[0];
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1];
+
+    expect(options.options[0].id).toBe('123');
+    expect(new URL(String(optionsUrl), 'http://localhost').pathname).toBe('/api/v1/usage/api-keys/options');
+    expect(optionsInit).toMatchObject({ credentials: 'include', signal, cache: 'no-store' });
+    expect(updated.label).toBe('sk-*********123456');
+    expect(new URL(String(updateUrl), 'http://localhost').pathname).toBe('/api/v1/usage/api-keys/123');
+    expect(updateInit).toMatchObject({ credentials: 'include', method: 'PATCH' });
+    expect(updateInit?.body).toBe(JSON.stringify({ keyAlias: '' }));
+  });
+
+  it('loads paged usage identities for one credential auth type', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ identities: [], total_count: 25, page: 3, page_size: 10, total_pages: 3 }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageIdentitiesPage(signal, { authType: 2, page: 3, pageSize: 10 });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.total_count).toBe(25);
+    expect(parsed.pathname).toBe('/api/v1/usage/identities/page');
+    expect(parsed.searchParams.get('auth_type')).toBe('2');
+    expect(parsed.searchParams.get('page')).toBe('3');
+    expect(parsed.searchParams.get('page_size')).toBe('10');
+    expect(init).toMatchObject({ credentials: 'include', signal });
+  });
+
+  it('loads cached quota for current page auth indexes without refreshing', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        items: [{ id: 'auth-1', quota: [{ key: 'rate_limit.secondary_window', label: 'Weekly', remaining: 12 }] }],
+      }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageQuotaCache(['auth-1'], signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.items[0].id).toBe('auth-1');
+    expect(response.items[0].quota[0].remaining).toBe(12);
+    expect(parsed.pathname).toBe('/api/v1/quota/cache');
     expect(init).toMatchObject({ credentials: 'include', method: 'POST', signal });
+    expect(init?.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(init?.body).toBe(JSON.stringify({ auth_indexes: ['auth-1'] }));
+  });
+
+  it('creates quota refresh tasks for current page auth indexes', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        tasks: [{ authIndex: 'auth-1', taskId: 'task-1' }],
+        rejected: [],
+        accepted: 1,
+        skipped: 0,
+        limit: 1,
+      }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await refreshUsageQuotas(['auth-1'], signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.tasks[0]).toEqual({ authIndex: 'auth-1', taskId: 'task-1' });
+    expect(response.limit).toBe(1);
+    expect(parsed.pathname).toBe('/api/v1/quota/refresh');
+    expect(init).toMatchObject({ credentials: 'include', method: 'POST', signal });
+    expect(init?.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(init?.body).toBe(JSON.stringify({ auth_indexes: ['auth-1'] }));
+  });
+
+  it('loads quota refresh task status', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        taskId: 'task-1',
+        authIndex: 'auth-1',
+        status: 'completed',
+        quota: { id: 'auth-1', quota: [{ key: 'rate_limit.primary_window', label: '5h' }] },
+      }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUsageQuotaRefreshTask('task-1', signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.status).toBe('completed');
+    expect(response.quota?.id).toBe('auth-1');
+    expect(parsed.pathname).toBe('/api/v1/quota/refresh/task-1');
+    expect(init).toMatchObject({ credentials: 'include', signal });
+  });
+
+  it('loads update check status from the protected endpoint', async () => {
+    vi.stubGlobal('window', { __APP_BASE_PATH__: undefined });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        currentVersion: 'v1.2.3',
+        latestVersion: 'v1.2.4',
+        updateAvailable: true,
+        canCompare: true,
+        message: 'new version available: v1.2.4',
+      }),
+    } as Response);
+    const signal = new AbortController().signal;
+
+    const response = await fetchUpdateCheck(signal);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), 'http://localhost');
+
+    expect(response.latestVersion).toBe('v1.2.4');
+    expect(response.updateAvailable).toBe(true);
+    expect(parsed.pathname).toBe('/api/v1/update/check');
+    expect(init).toMatchObject({ credentials: 'include', signal });
   });
 });

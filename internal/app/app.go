@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
+	"net/http"
+	"sync"
 	"time"
 
 	"cpa-usage-keeper/internal/api"
@@ -13,43 +15,52 @@ import (
 	"cpa-usage-keeper/internal/cpa"
 	"cpa-usage-keeper/internal/logging"
 	"cpa-usage-keeper/internal/poller"
+	"cpa-usage-keeper/internal/quota"
 	"cpa-usage-keeper/internal/repository"
 	"cpa-usage-keeper/internal/service"
+	webui "cpa-usage-keeper/web"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
+// Runner 是 App 后台任务的最小接口，具体语义由字段名和实现方法表达。
 type Runner interface {
 	Run(ctx context.Context) error
+}
+
+// StatusProvider 只提供前端状态和手动同步入口，不作为后台 runner 启动。
+type StatusProvider interface {
 	Status() poller.Status
 	SyncNow(ctx context.Context) error
 }
 
-type App struct {
-	Config                  *config.Config
-	ConfiguredUsageSyncMode string
-	DB                      *gorm.DB
-	Router                  *gin.Engine
-	Poller                  Runner
-	Maintenance             *StorageCleanupRunner
-	LogCloser               io.Closer
+type Options struct {
+	EnvFile string
 }
 
-var redisStartupProbe = func(ctx context.Context, cfg config.Config) error {
-	client := cpa.NewRedisQueueClient(
-		cfg.CPABaseURL,
-		cfg.RedisQueueAddr,
-		cfg.CPAManagementKey,
-		cfg.RequestTimeout,
-		cfg.RedisQueueKey,
-		cfg.RedisQueueBatchSize,
-	)
-	return client.Probe(ctx)
+type App struct {
+	Config            *config.Config
+	DB                *gorm.DB
+	Router            *gin.Engine
+	Poller            StatusProvider
+	RedisPull         Runner
+	RedisProcess      Runner
+	Maintenance       *StorageCleanupRunner
+	MetadataSync      *MetadataSyncRunner
+	BackupMaintenance *DatabaseBackupRunner
+	LogCloser         io.Closer
+
+	backgroundCancel context.CancelFunc
+	backgroundWG     sync.WaitGroup
 }
 
 func New() (*App, error) {
-	cfg, err := config.LoadFromEnv()
+	return NewWithOptions(Options{})
+}
+
+func NewWithOptions(options Options) (*App, error) {
+	cfg, err := config.Load(config.LoadOptions{EnvFile: options.EnvFile})
 	if err != nil {
 		return nil, err
 	}
@@ -68,21 +79,41 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		_ = logCloser.Close()
 		return nil, err
 	}
-	if err := runTemporaryStartupSnapshotRunsCleanup(db); err != nil {
+	// migrations 完成后、后台 runner 启动前先追平 Overview 增量表，避免首个页面请求触发大批量聚合。
+	logrus.Info("starting usage overview aggregation catch-up")
+	if err := repository.AggregateUsageOverviewStats(context.Background(), db, time.Now()); err != nil {
+		_ = closeGormDB(db)
 		_ = logCloser.Close()
 		return nil, err
 	}
+	logrus.Info("completed usage overview aggregation catch-up")
 
-	configuredUsageSyncMode := cfg.UsageSyncMode
-	cfg = resolveUsageSyncMode(context.Background(), cfg)
 	syncService := service.NewSyncService(db, cfg)
-	backgroundPoller := newBackgroundRunner(syncService, cfg)
+	backgroundPoller := poller.NewRedisDrain(syncService, poller.RedisDrainConfig{
+		IdleInterval: cfg.RedisQueueIdleInterval,
+		ErrorBackoff: cfg.RedisQueueErrorBackoff,
+	})
+	var backupMaintenance *DatabaseBackupRunner
+	if cfg.BackupEnabled {
+		sqlDB, err := db.DB()
+		if err != nil {
+			_ = closeGormDB(db)
+			_ = logCloser.Close()
+			return nil, err
+		}
+		backupStore := newDatabaseBackupStore(sqlDB, cfg.BackupDir)
+		backupMaintenance = NewDatabaseBackupRunner(backupStore, backupStore, cfg.BackupInterval, cfg.BackupRetentionDays)
+	}
 
 	usageService := service.NewUsageService(db)
-	authFileService := service.NewAuthFileService(db)
-	providerMetadataService := service.NewProviderMetadataService(db)
-	pricingModelsClient := cpa.NewClient(cfg.CPABaseURL, cfg.CPAManagementKey, cfg.RequestTimeout)
-	pricingService := service.NewPricingService(db, pricingModelsClient)
+	usageIdentityService := service.NewUsageIdentityService(db)
+	cpaAPIKeyService := service.NewCPAAPIKeyService(db)
+	cpaClient := cpa.NewClient(cfg.CPABaseURL, cfg.CPAManagementKey, cfg.RequestTimeout, cfg.TLSSkipVerify)
+	if cfg.TLSSkipVerify {
+		logrus.WithField("cpa_base_url", cfg.CPABaseURL).Warn("TLS certificate verification is disabled for CPA and Redis queue connections")
+	}
+	pricingService := service.NewPricingService(db, cpaClient)
+	quotaService := quota.NewService(db, cpaClient)
 	sessionManager := auth.NewSessionManager(cfg.AuthSessionTTL)
 	authHandler := api.NewAuthHandler(api.AuthConfig{
 		Enabled:       cfg.AuthEnabled,
@@ -92,18 +123,20 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 	}, sessionManager)
 
 	return &App{
-		Config:                  &cfg,
-		ConfiguredUsageSyncMode: configuredUsageSyncMode,
-		DB:                      db,
-		Poller:                  backgroundPoller,
-		Maintenance:             NewStorageCleanupRunner(syncService),
-		LogCloser:               logCloser,
+		Config: &cfg,
+		DB:     db,
+		Poller: backgroundPoller,
+		// Redis pull/process 分成两个后台 runner，避免远端拉取和本地 SQLite 处理互相等待。
+		RedisPull:         poller.NewRedisPullRunner(backgroundPoller),
+		RedisProcess:      poller.NewRedisProcessRunner(backgroundPoller),
+		Maintenance:       NewStorageCleanupRunner(syncService),
+		MetadataSync:      NewMetadataSyncRunner(syncService, cfg.MetadataSyncInterval),
+		BackupMaintenance: backupMaintenance,
+		LogCloser:         logCloser,
 		Router: api.NewRouter(
-			filepath.Join("web", "dist"),
+			webui.Static,
 			backgroundPoller,
 			usageService,
-			authFileService,
-			providerMetadataService,
 			pricingService,
 			api.AuthConfig{
 				Enabled:       cfg.AuthEnabled,
@@ -113,62 +146,44 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 			},
 			authHandler,
 			cfg.AppBasePath,
+			api.OptionalProviders{
+				UsageIdentity: usageIdentityService,
+				Quota:         quotaService,
+				CPAAPIKeys:    cpaAPIKeyService,
+				Status:        api.StatusRouteConfig{CPAPublicURL: cfg.CPAPublicURL},
+			},
 		),
 	}, nil
 }
 
-func resolveUsageSyncMode(ctx context.Context, cfg config.Config) config.Config {
-	if cfg.UsageSyncMode != "auto" {
-		return cfg
+func closeGormDB(db *gorm.DB) error {
+	if db == nil {
+		return nil
 	}
-	if err := redisStartupProbe(ctx, cfg); err != nil {
-		cfg.UsageSyncMode = "legacy_export"
-		logrus.WithError(err).WithFields(logrus.Fields{
-			"configured_mode": "auto",
-			"effective_mode":  cfg.UsageSyncMode,
-		}).Info("usage sync auto mode resolved")
-		return cfg
-	}
-	cfg.UsageSyncMode = "redis"
-	logrus.WithFields(logrus.Fields{
-		"configured_mode": "auto",
-		"effective_mode":  cfg.UsageSyncMode,
-	}).Info("usage sync auto mode resolved")
-	return cfg
-}
-
-func newBackgroundRunner(syncService *service.SyncService, cfg config.Config) Runner {
-	if cfg.UsageSyncMode == "redis" {
-		return poller.NewRedisDrain(syncService, poller.RedisDrainConfig{
-			IdleInterval:     cfg.RedisQueueIdleInterval,
-			ErrorBackoff:     cfg.RedisQueueErrorBackoff,
-			MetadataInterval: cfg.RedisMetadataSyncInterval,
-		})
-	}
-	return poller.New(syncService, cfg.PollInterval)
-}
-
-// runTemporaryStartupSnapshotRunsCleanup 是启动期额外执行的 snapshot_runs 治理入口，和每日清理共用 CleanupSnapshotRuns 语义。
-// 它只处理 snapshot_runs 并执行 VACUUM，不包含每日 CleanupStorage 中的 redis_usage_inboxes 清理。
-func runTemporaryStartupSnapshotRunsCleanup(db *gorm.DB) error {
-	logrus.Info("temporary snapshot runs cleanup started")
-	if _, err := repository.CleanupSnapshotRuns(db, time.Now()); err != nil {
-		logrus.WithError(err).Error("temporary snapshot runs cleanup failed")
+	sqlDB, err := db.DB()
+	if err != nil {
 		return err
 	}
-	if err := repository.Vacuum(db); err != nil {
-		logrus.WithError(err).Error("temporary snapshot runs cleanup failed")
-		return err
-	}
-	logrus.Info("temporary snapshot runs cleanup completed")
-	return nil
+	return sqlDB.Close()
 }
 
 func (a *App) Close() error {
-	if a == nil || a.LogCloser == nil {
+	if a == nil {
 		return nil
 	}
-	return a.LogCloser.Close()
+
+	a.stopBackgroundTasks()
+
+	var closeErr error
+	if a.DB != nil {
+		closeErr = errors.Join(closeErr, closeGormDB(a.DB))
+		a.DB = nil
+	}
+	if a.LogCloser != nil {
+		closeErr = errors.Join(closeErr, a.LogCloser.Close())
+		a.LogCloser = nil
+	}
+	return closeErr
 }
 
 func (a *App) Run() error {
@@ -176,29 +191,72 @@ func (a *App) Run() error {
 		return fmt.Errorf("application is not initialized")
 	}
 
-	configuredMode := a.ConfiguredUsageSyncMode
-	if configuredMode == "" {
-		configuredMode = a.Config.UsageSyncMode
-	}
-	logrus.WithFields(logrus.Fields{
-		"configured_mode": configuredMode,
-		"effective_mode":  a.Config.UsageSyncMode,
-	}).Info("usage sync mode selected")
-
-	if a.Poller != nil {
-		go func() {
-			if err := a.Poller.Run(context.Background()); err != nil {
-				logrus.Errorf("poller stopped: %v", err)
+	ctx := a.startBackgroundContext()
+	defer a.stopBackgroundTasks()
+	if a.RedisPull != nil {
+		a.startBackgroundTask(func() {
+			if err := a.RedisPull.Run(ctx); err != nil {
+				logrus.Errorf("redis pull stopped: %v", err)
 			}
-		}()
+		})
+	}
+	if a.RedisProcess != nil {
+		a.startBackgroundTask(func() {
+			if err := a.RedisProcess.Run(ctx); err != nil {
+				logrus.Errorf("redis process stopped: %v", err)
+			}
+		})
 	}
 	if a.Maintenance != nil {
-		go func() {
-			if err := a.Maintenance.Run(context.Background()); err != nil {
+		a.startBackgroundTask(func() {
+			if err := a.Maintenance.Run(ctx); err != nil {
 				logrus.Errorf("maintenance cleanup stopped: %v", err)
 			}
-		}()
+		})
+	}
+	if a.MetadataSync != nil {
+		a.startBackgroundTask(func() {
+			if err := a.MetadataSync.Run(ctx); err != nil {
+				logrus.Errorf("metadata sync stopped: %v", err)
+			}
+		})
+	}
+	if a.BackupMaintenance != nil {
+		a.startBackgroundTask(func() {
+			if err := a.BackupMaintenance.Run(ctx); err != nil {
+				logrus.Errorf("database backup stopped: %v", err)
+			}
+		})
 	}
 
-	return a.Router.Run(":" + a.Config.AppPort)
+	server := &http.Server{
+		Addr:    ":" + a.Config.AppPort,
+		Handler: a.Router,
+	}
+	if a.Config.TLSEnabled {
+		return server.ListenAndServeTLS(a.Config.TLSCertFile, a.Config.TLSKeyFile)
+	}
+	return server.ListenAndServe()
+}
+
+func (a *App) startBackgroundContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.backgroundCancel = cancel
+	return ctx
+}
+
+func (a *App) startBackgroundTask(run func()) {
+	a.backgroundWG.Add(1)
+	go func() {
+		defer a.backgroundWG.Done()
+		run()
+	}()
+}
+
+func (a *App) stopBackgroundTasks() {
+	if a.backgroundCancel != nil {
+		a.backgroundCancel()
+		a.backgroundCancel = nil
+	}
+	a.backgroundWG.Wait()
 }

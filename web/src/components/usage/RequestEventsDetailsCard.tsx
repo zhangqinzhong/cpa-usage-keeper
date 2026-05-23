@@ -5,7 +5,15 @@ import { Card } from '@/components/ui/Card';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Select } from '@/components/ui/Select';
 import type { UsageEvent, UsageSourceFilterOption } from '@/lib/types';
-import { formatDurationMs, LATENCY_SOURCE_FIELD, normalizeAuthIndex } from '@/utils/usage';
+import {
+  calculateCacheRate,
+  calculateCost,
+  formatDurationMs,
+  formatUsd,
+  LATENCY_SOURCE_FIELD,
+  normalizeAuthIndex,
+  type ModelPrice,
+} from '@/utils/usage';
 import { downloadBlob } from '@/utils/download';
 import styles from '@/pages/UsagePage.module.scss';
 
@@ -30,10 +38,12 @@ type RequestEventRow = {
   timestampMs: number;
   timestampLabel: string;
   model: string;
+  reasoningEffort: string;
   sourceRaw: string;
   source: string;
   sourceType: string;
   authIndex: string;
+  isDelete: boolean;
   failed: boolean;
   latencyMs: number | null;
   inputTokens: number;
@@ -41,6 +51,9 @@ type RequestEventRow = {
   reasoningTokens: number;
   cachedTokens: number;
   totalTokens: number;
+  cacheRate: string;
+  cost: number;
+  hasPrice: boolean;
 };
 
 export interface RequestEventsDetailsCardProps {
@@ -56,6 +69,7 @@ export interface RequestEventsDetailsCardProps {
   modelFilter: string;
   sourceFilter: string;
   resultFilter: string;
+  modelPrices: Record<string, ModelPrice>;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
   onModelFilterChange: (model: string) => void;
@@ -69,6 +83,17 @@ const toNumber = (value: unknown): number => {
   return parsed;
 };
 
+const formatRequestEventTimestamp = (timestamp: string): string => {
+  const match = timestamp.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/);
+  if (!match) return timestamp || '-';
+  return `${match[1]}/${match[2]}/${match[3]} ${match[4]}:${match[5]}:${match[6]}`;
+};
+
+const formatCacheRateForSource = (cachedTokens: number, inputTokens: number, sourceType?: string): string => {
+  const rate = calculateCacheRate({ inputTokens, cachedTokens, sourceType });
+  return rate === null ? '-' : `${rate.toFixed(2)}%`;
+};
+
 const encodeCsv = (value: string | number): string => {
   const text = String(value ?? '');
   const trimmedLeft = text.replace(/^\s+/, '');
@@ -76,11 +101,14 @@ const encodeCsv = (value: string | number): string => {
   return `"${safeText.replace(/"/g, '""')}"`;
 };
 
-function RequestEventsTitle({ title, subtitle, eyebrow }: { title: string; subtitle: string; eyebrow: string }) {
+function RequestEventsTitle({ title, subtitle, eyebrow, totalLabel }: { title: string; subtitle: string; eyebrow: string; totalLabel: string }) {
   return (
     <div className={styles.sectionTitleBlock}>
       <span className={styles.sectionEyebrow}>{eyebrow}</span>
-      <h3 className={styles.sectionTitle}>{title}</h3>
+      <div className={styles.requestEventsTitleRow}>
+        <h3 className={styles.sectionTitle}>{title}</h3>
+        <span className={styles.requestEventsCountBadge}>{totalLabel}</span>
+      </div>
       <p className={styles.sectionSubtitle}>{subtitle}</p>
     </div>
   );
@@ -99,13 +127,14 @@ export function RequestEventsDetailsCard({
   modelFilter,
   sourceFilter,
   resultFilter,
+  modelPrices,
   onPageChange,
   onPageSizeChange,
   onModelFilterChange,
   onSourceFilterChange,
   onResultFilterChange,
 }: RequestEventsDetailsCardProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const latencyHint = t('usage_stats.latency_unit_hint', {
     field: LATENCY_SOURCE_FIELD,
     unit: t('usage_stats.duration_unit_ms'),
@@ -115,7 +144,6 @@ export function RequestEventsDetailsCard({
     return events.map((event, index) => {
       const timestamp = event.timestamp;
       const timestampMs = Date.parse(timestamp);
-      const date = Number.isNaN(timestampMs) ? null : new Date(timestampMs);
       const sourceRaw = String(event.source_raw ?? '').trim() || String(event.source ?? '').trim();
       const authIndexRaw = event.auth_index as unknown;
       const authIndex =
@@ -125,23 +153,44 @@ export function RequestEventsDetailsCard({
       const source = String(event.source ?? '').trim() || '-';
       const sourceType = String(event.source_type ?? '').trim();
       const model = String(event.model ?? '').trim() || '-';
+      const reasoningEffort = String(event.reasoning_effort ?? '').trim() || '-';
       const inputTokens = Math.max(toNumber(event.tokens?.input_tokens), 0);
       const outputTokens = Math.max(toNumber(event.tokens?.output_tokens), 0);
       const reasoningTokens = Math.max(toNumber(event.tokens?.reasoning_tokens), 0);
       const cachedTokens = Math.max(toNumber(event.tokens?.cached_tokens), 0);
       const totalTokens = Math.max(toNumber(event.tokens?.total_tokens), 0);
       const latencyMs = Number.isFinite(event.latency_ms) ? event.latency_ms : null;
+      const pricing = modelPrices[model];
+      const cost = calculateCost({
+        timestamp,
+        source,
+        source_raw: sourceRaw,
+        source_type: sourceType,
+        auth_index: authIndex,
+        failed: event.failed === true,
+        latency_ms: latencyMs ?? 0,
+        tokens: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          reasoning_tokens: reasoningTokens,
+          cached_tokens: cachedTokens,
+          total_tokens: totalTokens,
+        },
+        __modelName: model,
+      }, modelPrices);
 
       return {
         id: event.id ? String(event.id) : `${timestamp}-${model}-${sourceRaw || source}-${authIndex}-${index}`,
         timestamp,
         timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
-        timestampLabel: date ? date.toLocaleString(i18n.language) : timestamp || '-',
+        timestampLabel: formatRequestEventTimestamp(timestamp),
         model,
+        reasoningEffort,
         sourceRaw: sourceRaw || '-',
         source,
         sourceType,
         authIndex,
+        isDelete: event.isDelete === true,
         failed: event.failed === true,
         latencyMs,
         inputTokens,
@@ -149,9 +198,12 @@ export function RequestEventsDetailsCard({
         reasoningTokens,
         cachedTokens,
         totalTokens,
+        cacheRate: formatCacheRateForSource(cachedTokens, inputTokens, sourceType),
+        cost,
+        hasPrice: Boolean(pricing),
       };
     });
-  }, [events, i18n.language]);
+  }, [events, modelPrices]);
 
   const hasLatencyData = useMemo(() => rows.some((row) => row.latencyMs !== null), [rows]);
 
@@ -166,9 +218,10 @@ export function RequestEventsDetailsCard({
   const sourceOptions = useMemo(() => {
     const options = [
       { value: ALL_FILTER, label: t('usage_stats.filter_all') },
-      ...backendSourceOptions.map((source) => ({ value: source.value, label: source.label || source.value })),
+      ...backendSourceOptions.map((source) => ({ value: source.value, label: source.displayName || source.label || source.value })),
     ];
-    const selectedLabel = backendSourceOptions.find((source) => source.value === sourceFilter)?.label;
+    const selectedSource = backendSourceOptions.find((source) => source.value === sourceFilter);
+    const selectedLabel = selectedSource?.displayName || selectedSource?.label;
     return appendSelectedOption(options, sourceFilter, selectedLabel || sourceFilter);
   }, [backendSourceOptions, sourceFilter, t]);
 
@@ -203,16 +256,10 @@ export function RequestEventsDetailsCard({
     sourceFilter !== ALL_FILTER ||
     resultFilter !== ALL_FILTER;
 
-  const pageSizeSelectOptions = useMemo(
-    () => pageSizeOptions.map((option) => ({ value: String(option), label: String(option) })),
-    [pageSizeOptions]
-  );
   const computedTotalPages = pageSize > 0 ? Math.ceil(totalCount / pageSize) : 0;
   const safeTotalPages = Math.max(totalPages, computedTotalPages, rows.length > 0 ? 1 : 0);
   const safePage = safeTotalPages > 0 ? Math.min(Math.max(page, 1), safeTotalPages) : 0;
-  const pageLabel = safeTotalPages > 0
-    ? t('usage_stats.request_events_page_control', { page: safePage, totalPages: safeTotalPages })
-    : t('usage_stats.request_events_page_empty');
+  const pageLabel = safeTotalPages > 0 ? `${safePage} / ${safeTotalPages}` : t('usage_stats.request_events_page_empty');
 
   const handleClearFilters = () => {
     onModelFilterChange(ALL_FILTER);
@@ -226,6 +273,7 @@ export function RequestEventsDetailsCard({
     const csvHeader = [
       'timestamp',
       'model',
+      'reasoning_effort',
       'source',
       'source_raw',
       'auth_index',
@@ -236,12 +284,14 @@ export function RequestEventsDetailsCard({
       'reasoning_tokens',
       'cached_tokens',
       'total_tokens',
+      'cost_usd',
     ];
 
     const csvRows = rows.map((row) =>
       [
         row.timestamp,
         row.model,
+        row.reasoningEffort === '-' ? '' : row.reasoningEffort,
         row.source,
         row.sourceRaw,
         row.authIndex,
@@ -252,6 +302,7 @@ export function RequestEventsDetailsCard({
         row.reasoningTokens,
         row.cachedTokens,
         row.totalTokens,
+        row.hasPrice ? row.cost.toFixed(6) : '',
       ]
         .map((value) => encodeCsv(value))
         .join(',')
@@ -271,6 +322,7 @@ export function RequestEventsDetailsCard({
     const payload = rows.map((row) => ({
       timestamp: row.timestamp,
       model: row.model,
+      reasoning_effort: row.reasoningEffort === '-' ? '' : row.reasoningEffort,
       source: row.source,
       source_raw: row.sourceRaw,
       auth_index: row.authIndex,
@@ -283,6 +335,7 @@ export function RequestEventsDetailsCard({
         cached_tokens: row.cachedTokens,
         total_tokens: row.totalTokens,
       },
+      ...(row.hasPrice ? { cost_usd: Number(row.cost.toFixed(6)) } : {}),
     }));
 
     const content = JSON.stringify(payload, null, 2);
@@ -298,11 +351,13 @@ export function RequestEventsDetailsCard({
 
   return (
     <Card
+      className={styles.requestEventsCard}
       title={
         <RequestEventsTitle
           eyebrow={t('usage_stats.request_events_eyebrow')}
           title={t('usage_stats.request_events_title')}
           subtitle={t('usage_stats.request_events_subtitle')}
+          totalLabel={t('usage_stats.request_events_total_count', { count: totalCount })}
         />
       }
       extra={
@@ -310,6 +365,7 @@ export function RequestEventsDetailsCard({
           <Button
             variant="ghost"
             size="sm"
+            className={styles.usagePillAction}
             onClick={handleClearFilters}
             disabled={!hasActiveFilters}
           >
@@ -328,7 +384,7 @@ export function RequestEventsDetailsCard({
               value={effectiveModelFilter}
               options={modelOptions}
               onChange={onModelFilterChange}
-              className={styles.requestEventsSelect}
+              className={`${styles.requestEventsSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_model')}
               fullWidth={false}
             />
@@ -341,7 +397,7 @@ export function RequestEventsDetailsCard({
               value={effectiveSourceFilter}
               options={sourceOptions}
               onChange={onSourceFilterChange}
-              className={styles.requestEventsSelect}
+              className={`${styles.requestEventsSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_source')}
               fullWidth={false}
             />
@@ -354,47 +410,11 @@ export function RequestEventsDetailsCard({
               value={effectiveResultFilter}
               options={resultOptions}
               onChange={onResultFilterChange}
-              className={styles.requestEventsResultSelect}
+              className={`${styles.requestEventsResultSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_result')}
               fullWidth={false}
             />
           </label>
-        </div>
-
-        <div className={styles.requestEventsPaginationControls}>
-          <div className={styles.requestEventsPaginationItem}>
-            <span className={styles.requestEventsFilterLabel}>{t('usage_stats.request_events_rows_per_page')}</span>
-            <Select
-              value={String(pageSize)}
-              options={pageSizeSelectOptions}
-              onChange={(value) => onPageSizeChange(Number(value))}
-              className={`${styles.requestEventsPageSizeSelect} ${styles.requestEventsPageSizeSelectCompact}`}
-              ariaLabel={`${t('usage_stats.request_events_rows_per_page')}: ${pageSizeOptions.join(', ')}`}
-              fullWidth={false}
-              disabled={loading}
-            />
-          </div>
-          <div className={styles.requestEventsPaginationItem}>
-            <span className={styles.requestEventsFilterLabel}>{pageLabel}</span>
-            <div className={styles.requestEventsPagerControls}>
-              <button
-                type="button"
-                className={styles.requestEventsPagerButton}
-                onClick={() => onPageChange(page - 1)}
-                disabled={loading || safePage <= 1}
-              >
-                {t('usage_stats.request_events_previous_page')}
-              </button>
-              <button
-                type="button"
-                className={styles.requestEventsPagerButton}
-                onClick={() => onPageChange(page + 1)}
-                disabled={loading || safeTotalPages === 0 || safePage >= safeTotalPages}
-              >
-                {t('usage_stats.request_events_next_page')}
-              </button>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -407,28 +427,23 @@ export function RequestEventsDetailsCard({
         />
       ) : (
         <>
-          <div className={styles.requestEventsTableMeta}>
-            <div className={styles.requestEventsCountGroup}>
-              <span>{t('usage_stats.request_events_count', { count: rows.length })}</span>
-              <span>{t('usage_stats.request_events_total_count', { count: totalCount })}</span>
-            </div>
-            {hasLatencyData && <span className={styles.requestEventsLimitHint}>{latencyHint}</span>}
-          </div>
-
           <div className={styles.requestEventsTableWrapper}>
             <table className={styles.table}>
               <thead>
                 <tr>
                   <th>{t('usage_stats.request_events_timestamp')}</th>
                   <th>{t('usage_stats.model_name')}</th>
+                  <th>{t('usage_stats.reasoning_effort')}</th>
                   <th>{t('usage_stats.request_events_source')}</th>
                   <th>{t('usage_stats.request_events_result')}</th>
                   {hasLatencyData && <th title={latencyHint}>{t('usage_stats.time')}</th>}
                   <th>{t('usage_stats.input_tokens')}</th>
                   <th>{t('usage_stats.output_tokens')}</th>
-                  <th>{t('usage_stats.reasoning_tokens')}</th>
+                  <th className={styles.requestEventsReasoningHeader}>{t('usage_stats.reasoning_tokens')}</th>
                   <th>{t('usage_stats.cached_tokens')}</th>
+                  <th>{t('usage_stats.cache_rate')}</th>
                   <th>{t('usage_stats.total_tokens')}</th>
+                  <th>{t('usage_stats.total_cost')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -438,11 +453,21 @@ export function RequestEventsDetailsCard({
                       {row.timestampLabel}
                     </td>
                     <td className={styles.modelCell}>{row.model}</td>
+                    <td>{row.reasoningEffort}</td>
                     <td className={styles.requestEventsSourceCell} title={row.source}>
-                      <span>{row.source}</span>
-                      {row.sourceType && (
-                        <span className={styles.credentialType}>{row.sourceType}</span>
-                      )}
+                      <span className={styles.requestEventsSourceStack}>
+                        <span className={styles.requestEventsSourceValue}>{row.source}</span>
+                        {(row.isDelete || row.sourceType) && (
+                          <span className={styles.requestEventsSourceTags}>
+                            {row.sourceType && (
+                              <span className={styles.credentialType}>{row.sourceType}</span>
+                            )}
+                            {row.isDelete && (
+                              <span className={styles.requestEventsDeletedTag}>{t('usage_stats.deleted')}</span>
+                            )}
+                          </span>
+                        )}
+                      </span>
                     </td>
                     <td>
                       <span
@@ -462,11 +487,33 @@ export function RequestEventsDetailsCard({
                     <td>{row.outputTokens.toLocaleString()}</td>
                     <td>{row.reasoningTokens.toLocaleString()}</td>
                     <td>{row.cachedTokens.toLocaleString()}</td>
+                    <td>{row.cacheRate}</td>
                     <td>{row.totalTokens.toLocaleString()}</td>
+                    <td title={row.hasPrice ? undefined : t('usage_stats.cost_need_price')}>
+                      {row.hasPrice ? formatUsd(row.cost) : '-'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+
+          <div className={styles.requestEventsPaginationFooter}>
+            <div className={styles.requestEventsPaginationControls}>
+              <label className={styles.requestEventsPageSizeControl}>
+                <span>{t('usage_stats.request_events_rows_per_page')}</span>
+                <select value={pageSize} onChange={(event) => onPageSizeChange(Number(event.target.value))} disabled={loading}>
+                  {pageSizeOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                </select>
+              </label>
+              <button type="button" className={styles.requestEventsPagerButton} onClick={() => onPageChange(page - 1)} disabled={loading || safePage <= 1}>
+                {t('usage_stats.request_events_previous_page')}
+              </button>
+              <span className={styles.requestEventsPaginationPage}>{pageLabel}</span>
+              <button type="button" className={styles.requestEventsPagerButton} onClick={() => onPageChange(page + 1)} disabled={loading || safeTotalPages === 0 || safePage >= safeTotalPages}>
+                {t('usage_stats.request_events_next_page')}
+              </button>
+            </div>
           </div>
         </>
       )}

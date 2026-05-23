@@ -3,27 +3,55 @@ package app
 import (
 	"bytes"
 	"context"
-	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"cpa-usage-keeper/internal/config"
-	"cpa-usage-keeper/internal/models"
+	"cpa-usage-keeper/internal/entities"
 	"cpa-usage-keeper/internal/poller"
 	"cpa-usage-keeper/internal/repository"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
 
-func TestNewWithConfigBuildsPollerAndRouter(t *testing.T) {
-	app, err := NewWithConfig(testAppConfig(t, "legacy_export"))
+func TestAppCloseClosesDatabase(t *testing.T) {
+	app, err := NewWithConfig(testAppConfig(t))
+	if err != nil {
+		t.Fatalf("NewWithConfig returned error: %v", err)
+	}
+	sqlDB, err := app.DB.DB()
+	if err != nil {
+		t.Fatalf("load sql db: %v", err)
+	}
+
+	if err := app.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	if err := sqlDB.Ping(); err == nil {
+		t.Fatal("expected database ping to fail after app close")
+	}
+}
+
+func TestNewWithConfigBuildsRedisDrainAndRouter(t *testing.T) {
+	app, err := NewWithConfig(testAppConfig(t))
 	if err != nil {
 		t.Fatalf("NewWithConfig returned error: %v", err)
 	}
 	defer app.Close()
 	if app.Poller == nil {
-		t.Fatal("expected poller to be initialized")
+		t.Fatal("expected poller status provider to be initialized")
+	}
+	if app.RedisPull == nil {
+		t.Fatal("expected redis pull runner to be initialized")
+	}
+	if app.RedisProcess == nil {
+		t.Fatal("expected redis process runner to be initialized")
 	}
 	if app.Router == nil {
 		t.Fatal("expected router to be initialized")
@@ -31,297 +59,239 @@ func TestNewWithConfigBuildsPollerAndRouter(t *testing.T) {
 	if app.LogCloser == nil {
 		t.Fatal("expected log closer to be initialized")
 	}
-}
-
-func TestNewWithConfigSelectsLegacyPoller(t *testing.T) {
-	app, err := NewWithConfig(testAppConfig(t, "legacy_export"))
-	if err != nil {
-		t.Fatalf("NewWithConfig returned error: %v", err)
+	if app.BackupMaintenance == nil {
+		t.Fatal("expected database backup runner to be initialized")
 	}
-	defer app.Close()
-	if _, ok := app.Poller.(*poller.Poller); !ok {
-		t.Fatalf("expected legacy_export to use interval poller, got %T", app.Poller)
-	}
-	if app.Maintenance == nil {
-		t.Fatal("expected maintenance cleanup runner to be initialized")
+	if app.MetadataSync == nil {
+		t.Fatal("expected metadata sync runner to be initialized")
 	}
 }
 
-func TestNewWithConfigSelectsRedisDrain(t *testing.T) {
-	app, err := NewWithConfig(testAppConfig(t, "redis"))
-	if err != nil {
-		t.Fatalf("NewWithConfig returned error: %v", err)
-	}
-	defer app.Close()
-	if _, ok := app.Poller.(*poller.RedisDrain); !ok {
-		t.Fatalf("expected redis to use redis drain, got %T", app.Poller)
-	}
-	if app.Maintenance == nil {
-		t.Fatal("expected maintenance cleanup runner to be initialized")
-	}
-}
-
-func TestNewWithConfigRunsTemporaryStartupSnapshotCleanup(t *testing.T) {
-	cfg := testAppConfig(t, "legacy_export")
-	seedDB, err := repository.OpenDatabase(cfg)
-	if err != nil {
-		t.Fatalf("OpenDatabase returned error: %v", err)
-	}
-	oldRun, err := repository.CreateSnapshotRun(seedDB, repository.SnapshotRunInput{FetchedAt: time.Now().AddDate(0, 0, -8), RawPayload: []byte(`old`)})
-	if err != nil {
-		t.Fatalf("CreateSnapshotRun old returned error: %v", err)
-	}
-	latestRun, err := repository.CreateSnapshotRun(seedDB, repository.SnapshotRunInput{FetchedAt: time.Now(), RawPayload: []byte(`latest`)})
-	if err != nil {
-		t.Fatalf("CreateSnapshotRun latest returned error: %v", err)
-	}
-	sqlDB, err := seedDB.DB()
-	if err != nil {
-		t.Fatalf("load seed sql db: %v", err)
-	}
-	if err := sqlDB.Close(); err != nil {
-		t.Fatalf("close seed sql db: %v", err)
-	}
-
+func TestNewWithConfigExposesConfiguredCPAPublicURL(t *testing.T) {
+	cfg := testAppConfig(t)
+	cfg.CPAPublicURL = "https://cpa.public.example.com/"
 	app, err := NewWithConfig(cfg)
 	if err != nil {
 		t.Fatalf("NewWithConfig returned error: %v", err)
 	}
 	defer app.Close()
 
-	var remaining []models.SnapshotRun
-	if err := app.DB.Order("id asc").Find(&remaining).Error; err != nil {
-		t.Fatalf("load remaining snapshot runs: %v", err)
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	app.Router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.Code)
 	}
-	if len(remaining) != 1 || remaining[0].ID != latestRun.ID {
-		t.Fatalf("expected startup cleanup to keep only latest snapshot %d and delete %d, got %+v", latestRun.ID, oldRun.ID, remaining)
+	body := resp.Body.String()
+	if !strings.Contains(body, `"cpa_public_url":"https://cpa.public.example.com/"`) {
+		t.Fatalf("expected CPA public URL in status response, got %s", body)
+	}
+	if strings.Contains(body, "cpa_management_url") {
+		t.Fatalf("expected status response to use cpa_public_url instead of cpa_management_url, got %s", body)
+	}
+}
+
+func TestNewWithConfigAggregatesExistingOverviewStatsBeforeRunnersStart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "app-startup-overview-catchup.db")
+	seedDB, err := repository.OpenDatabase(config.Config{SQLitePath: dbPath})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	if _, _, err := repository.InsertUsageEvents(seedDB, []entities.UsageEvent{
+		{EventKey: "legacy-event", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), TotalTokens: 150},
+	}); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	seedSQL, err := seedDB.DB()
+	if err != nil {
+		t.Fatalf("load seed sql db: %v", err)
+	}
+	if err := seedSQL.Close(); err != nil {
+		t.Fatalf("close seed db: %v", err)
+	}
+
+	logDir := t.TempDir()
+
+	cfg := testAppConfig(t)
+	cfg.SQLitePath = dbPath
+	cfg.LogFileEnabled = true
+	cfg.LogDir = logDir
+	app, err := NewWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewWithConfig returned error: %v", err)
+	}
+	defer app.Close()
+
+	var checkpoint entities.UsageOverviewAggregationCheckpoint
+	if err := app.DB.Where("name = ?", "overview").First(&checkpoint).Error; err != nil {
+		t.Fatalf("load overview checkpoint returned error: %v", err)
+	}
+	if checkpoint.LastAggregatedUsageEventID == 0 {
+		t.Fatalf("expected startup catch-up to aggregate legacy usage events, got checkpoint %+v", checkpoint)
+	}
+	logContent := readAppLogFile(t, logDir)
+	if !strings.Contains(logContent, "starting usage overview aggregation catch-up") {
+		t.Fatalf("expected startup catch-up start log, got %s", logContent)
+	}
+	if !strings.Contains(logContent, "completed usage overview aggregation catch-up") {
+		t.Fatalf("expected startup catch-up completion log, got %s", logContent)
+	}
+}
+
+func TestNewWithConfigSkipsBackupRunnerWhenDisabled(t *testing.T) {
+	cfg := testAppConfig(t)
+	cfg.BackupEnabled = false
+	app, err := NewWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewWithConfig returned error: %v", err)
+	}
+	defer app.Close()
+	if app.BackupMaintenance != nil {
+		t.Fatal("expected database backup runner to be skipped when backups are disabled")
+	}
+}
+
+func TestNewWithConfigSelectsRedisDrain(t *testing.T) {
+	app, err := NewWithConfig(testAppConfig(t))
+	if err != nil {
+		t.Fatalf("NewWithConfig returned error: %v", err)
+	}
+	defer app.Close()
+	if _, ok := app.Poller.(*poller.RedisDrain); !ok {
+		t.Fatalf("expected redis status provider to use redis drain, got %T", app.Poller)
+	}
+	if _, ok := app.RedisPull.(*poller.RedisPullRunner); !ok {
+		t.Fatalf("expected redis pull runner, got %T", app.RedisPull)
+	}
+	if _, ok := app.RedisProcess.(*poller.RedisProcessRunner); !ok {
+		t.Fatalf("expected redis process runner, got %T", app.RedisProcess)
+	}
+	if app.Maintenance == nil {
+		t.Fatal("expected maintenance cleanup runner to be initialized")
 	}
 }
 
 func TestNewWithConfigCreatesIndependentMaintenanceRunner(t *testing.T) {
-	for _, mode := range []string{"redis", "legacy_export"} {
-		t.Run(mode, func(t *testing.T) {
-			app, err := NewWithConfig(testAppConfig(t, mode))
-			if err != nil {
-				t.Fatalf("NewWithConfig returned error: %v", err)
-			}
-			defer app.Close()
-			if app.Poller == nil {
-				t.Fatal("expected sync poller to be initialized")
-			}
-			if app.Maintenance == nil {
-				t.Fatal("expected independent maintenance runner to be initialized")
-			}
-		})
-	}
-}
-
-func TestNewWithConfigAutoUsesRedisDrainWhenStartupProbeSucceeds(t *testing.T) {
-	probeCalls := 0
-	withRedisStartupProbe(t, func(context.Context, config.Config) error {
-		probeCalls++
-		return nil
-	})
-
-	app, err := NewWithConfig(testAppConfig(t, "auto"))
+	app, err := NewWithConfig(testAppConfig(t))
 	if err != nil {
 		t.Fatalf("NewWithConfig returned error: %v", err)
 	}
 	defer app.Close()
-
-	if probeCalls != 1 {
-		t.Fatalf("expected one startup probe, got %d", probeCalls)
+	if app.Poller == nil {
+		t.Fatal("expected sync status provider to be initialized")
 	}
-	if app.Config.UsageSyncMode != "redis" {
-		t.Fatalf("expected effective mode redis, got %q", app.Config.UsageSyncMode)
+	if app.RedisPull == nil {
+		t.Fatal("expected independent redis pull runner to be initialized")
 	}
-	if _, ok := app.Poller.(*poller.RedisDrain); !ok {
-		t.Fatalf("expected auto with successful probe to use redis drain, got %T", app.Poller)
-	}
-	if app.Maintenance == nil {
-		t.Fatal("expected maintenance cleanup runner to be initialized")
-	}
-}
-
-func TestNewWithConfigAutoUsesLegacyPollerWhenStartupProbeFails(t *testing.T) {
-	probeCalls := 0
-	withRedisStartupProbe(t, func(context.Context, config.Config) error {
-		probeCalls++
-		return errors.New("redis unavailable")
-	})
-
-	app, err := NewWithConfig(testAppConfig(t, "auto"))
-	if err != nil {
-		t.Fatalf("NewWithConfig returned error: %v", err)
-	}
-	defer app.Close()
-
-	if probeCalls != 1 {
-		t.Fatalf("expected one startup probe, got %d", probeCalls)
-	}
-	if app.Config.UsageSyncMode != "legacy_export" {
-		t.Fatalf("expected effective mode legacy_export, got %q", app.Config.UsageSyncMode)
-	}
-	if app.Config.PollInterval != time.Minute {
-		t.Fatalf("expected auto resolved legacy poller to keep configured poll interval, got %s", app.Config.PollInterval)
-	}
-	if _, ok := app.Poller.(*poller.Poller); !ok {
-		t.Fatalf("expected auto with failed probe to use legacy poller, got %T", app.Poller)
+	if app.RedisProcess == nil {
+		t.Fatal("expected independent redis process runner to be initialized")
 	}
 	if app.Maintenance == nil {
-		t.Fatal("expected maintenance cleanup runner to be initialized")
-	}
-}
-
-func TestResolveUsageSyncModeLogsEffectiveMode(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		probeErr  error
-		effective string
-	}{
-		{name: "redis", effective: "redis"},
-		{name: "legacy_export", probeErr: errors.New("redis unavailable"), effective: "legacy_export"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			logs := captureAppInfoLogs(t)
-			withRedisStartupProbe(t, func(context.Context, config.Config) error {
-				return tc.probeErr
-			})
-
-			cfg := testAppConfig(t, "auto")
-			resolved := resolveUsageSyncMode(context.Background(), cfg)
-			if resolved.UsageSyncMode != tc.effective {
-				t.Fatalf("expected effective mode %q, got %q", tc.effective, resolved.UsageSyncMode)
-			}
-			if resolved.PollInterval != cfg.PollInterval {
-				t.Fatalf("expected poll interval to remain %s, got %s", cfg.PollInterval, resolved.PollInterval)
-			}
-			content := logs.String()
-			for _, expected := range []string{"level=info", "msg=\"usage sync auto mode resolved\"", "configured_mode=auto", "effective_mode=" + tc.effective} {
-				if !strings.Contains(content, expected) {
-					t.Fatalf("expected auto resolution log to contain %q, got %q", expected, content)
-				}
-			}
-		})
-	}
-}
-
-func TestNewWithConfigDoesNotProbeForExplicitModes(t *testing.T) {
-	withRedisStartupProbe(t, func(context.Context, config.Config) error {
-		t.Fatal("unexpected startup probe")
-		return nil
-	})
-
-	for _, mode := range []string{"redis", "legacy_export"} {
-		t.Run(mode, func(t *testing.T) {
-			app, err := NewWithConfig(testAppConfig(t, mode))
-			if err != nil {
-				t.Fatalf("NewWithConfig returned error: %v", err)
-			}
-			defer app.Close()
-			if app.Config.UsageSyncMode != mode {
-				t.Fatalf("expected mode %q to remain unchanged, got %q", mode, app.Config.UsageSyncMode)
-			}
-		})
-	}
-}
-
-func TestTemporaryStartupSnapshotCleanupLogsStartAndSuccess(t *testing.T) {
-	logs := captureAppInfoLogs(t)
-	db, err := repository.OpenDatabase(testAppConfig(t, "legacy_export"))
-	if err != nil {
-		t.Fatalf("OpenDatabase returned error: %v", err)
-	}
-
-	if err := runTemporaryStartupSnapshotRunsCleanup(db); err != nil {
-		t.Fatalf("runTemporaryStartupSnapshotRunsCleanup returned error: %v", err)
-	}
-
-	content := logs.String()
-	for _, expected := range []string{"level=info", "msg=\"temporary snapshot runs cleanup started\"", "msg=\"temporary snapshot runs cleanup completed\""} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("expected temporary cleanup log to contain %q, got %q", expected, content)
-		}
-	}
-}
-
-func TestTemporaryStartupSnapshotCleanupLogsFailure(t *testing.T) {
-	logs := captureAppInfoLogs(t)
-
-	if err := runTemporaryStartupSnapshotRunsCleanup(nil); err == nil {
-		t.Fatal("expected runTemporaryStartupSnapshotRunsCleanup to return an error")
-	}
-
-	content := logs.String()
-	for _, expected := range []string{"level=error", "msg=\"temporary snapshot runs cleanup failed\""} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("expected temporary cleanup error log to contain %q, got %q", expected, content)
-		}
+		t.Fatal("expected independent maintenance runner to be initialized")
 	}
 }
 
 func TestRunStartsPollerAndMaintenanceIndependently(t *testing.T) {
-	cfg := testAppConfig(t, "redis")
+	cfg := testAppConfig(t)
 	cfg.AppPort = "invalid-port"
-	pollerStarted := make(chan struct{})
+	pullStarted := make(chan struct{})
+	processStarted := make(chan struct{})
 	maintenanceStarted := make(chan struct{})
+	metadataStarted := make(chan struct{})
+	backupStarted := make(chan struct{})
 	maintenance := NewStorageCleanupRunner(&maintenanceSyncStub{})
 	maintenance.sleep = func(context.Context, time.Duration) bool {
 		close(maintenanceStarted)
 		return false
 	}
+	metadataRunner := NewMetadataSyncRunner(&metadataSyncStub{}, time.Second)
+	metadataRunner.sleep = func(context.Context, time.Duration) bool {
+		close(metadataStarted)
+		return false
+	}
+	backupRunner := NewDatabaseBackupRunner(&databaseBackupWriterStub{}, nil, time.Second, 0)
+	backupRunner.sleep = func(context.Context, time.Duration) bool {
+		close(backupStarted)
+		return false
+	}
+	statusProvider := &appRunStub{started: make(chan struct{})}
 	app := &App{
-		Config:      &cfg,
-		Router:      gin.New(),
-		Poller:      &appRunStub{started: pollerStarted},
-		Maintenance: maintenance,
+		Config:            &cfg,
+		Router:            gin.New(),
+		Poller:            statusProvider,
+		RedisPull:         &appRunStub{started: pullStarted},
+		RedisProcess:      &appRunStub{started: processStarted},
+		Maintenance:       maintenance,
+		MetadataSync:      metadataRunner,
+		BackupMaintenance: backupRunner,
 	}
 
 	if err := app.Run(); err == nil {
 		t.Fatal("expected Run to return an error for invalid port")
 	}
 	select {
-	case <-pollerStarted:
+	case <-pullStarted:
 	case <-time.After(time.Second):
-		t.Fatal("expected poller runner to start")
+		t.Fatal("expected redis pull runner to start")
+	}
+	select {
+	case <-processStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected redis process runner to start")
+	}
+	select {
+	case <-statusProvider.started:
+		t.Fatal("expected poller status provider not to be started as a background runner")
+	default:
 	}
 	select {
 	case <-maintenanceStarted:
 	case <-time.After(time.Second):
 		t.Fatal("expected maintenance runner to start")
 	}
+	select {
+	case <-metadataStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected metadata sync runner to start")
+	}
+	select {
+	case <-backupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected database backup runner to start")
+	}
 }
 
-func TestRunLogsConfiguredUsageSyncMode(t *testing.T) {
-	var logs bytes.Buffer
-	previousOutput := logrus.StandardLogger().Out
-	previousFormatter := logrus.StandardLogger().Formatter
-	previousLevel := logrus.GetLevel()
-	logrus.SetOutput(&logs)
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	logrus.SetLevel(logrus.InfoLevel)
-	t.Cleanup(func() {
-		logrus.SetOutput(previousOutput)
-		logrus.SetFormatter(previousFormatter)
-		logrus.SetLevel(previousLevel)
-	})
-
-	cfg := testAppConfig(t, "redis")
+func TestRunCancelsBackgroundTasksWhenRouterStops(t *testing.T) {
+	cfg := testAppConfig(t)
 	cfg.AppPort = "invalid-port"
+	backupStarted := make(chan struct{})
+	backupCanceled := make(chan struct{})
+	backupRunner := NewDatabaseBackupRunner(&databaseBackupWriterStub{}, nil, time.Second, 0)
+	backupRunner.sleep = func(ctx context.Context, _ time.Duration) bool {
+		close(backupStarted)
+		<-ctx.Done()
+		close(backupCanceled)
+		return false
+	}
 	app := &App{
-		Config: &cfg,
-		Router: gin.New(),
+		Config:            &cfg,
+		Router:            gin.New(),
+		BackupMaintenance: backupRunner,
 	}
 
 	if err := app.Run(); err == nil {
 		t.Fatal("expected Run to return an error for invalid port")
 	}
-
-	content := logs.String()
-	for _, expected := range []string{"msg=\"usage sync mode selected\"", "configured_mode=redis", "effective_mode=redis"} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("expected usage sync mode log to contain %q, got %q", expected, content)
-		}
+	select {
+	case <-backupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected database backup runner to start")
+	}
+	select {
+	case <-backupCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("expected database backup runner context to be canceled")
 	}
 }
 
@@ -359,31 +329,32 @@ func captureAppInfoLogs(t *testing.T) *bytes.Buffer {
 	return &logs
 }
 
-func withRedisStartupProbe(t *testing.T, probe func(context.Context, config.Config) error) {
+func readAppLogFile(t *testing.T, logDir string) string {
 	t.Helper()
-	previous := redisStartupProbe
-	redisStartupProbe = probe
-	t.Cleanup(func() { redisStartupProbe = previous })
+	path := filepath.Join(logDir, "cpa-usage-keeper-"+time.Now().Format("2006-01-02")+".log")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read app log file: %v", err)
+	}
+	return string(content)
 }
 
-func testAppConfig(t *testing.T, syncMode string) config.Config {
+func testAppConfig(t *testing.T) config.Config {
 	t.Helper()
 	return config.Config{
-		AppPort:                   "8080",
-		CPABaseURL:                "https://cpa.example.com",
-		CPAManagementKey:          "secret",
-		UsageSyncMode:             syncMode,
-		PollInterval:              time.Minute,
-		RedisQueueIdleInterval:    time.Second,
-		RedisQueueErrorBackoff:    10 * time.Second,
-		RedisMetadataSyncInterval: 30 * time.Second,
-		SQLitePath:                t.TempDir() + "/app.db",
-		BackupEnabled:             true,
-		BackupDir:                 t.TempDir() + "/backups",
-		BackupRetentionDays:       30,
-		RequestTimeout:            5 * time.Second,
-		LogLevel:                  "info",
-		LogFileEnabled:            false,
-		LogRetentionDays:          7,
+		AppPort:                "8080",
+		CPABaseURL:             "https://cpa.example.com",
+		CPAManagementKey:       "secret",
+		RedisQueueIdleInterval: time.Second,
+		RedisQueueErrorBackoff: 10 * time.Second,
+		MetadataSyncInterval:   30 * time.Second,
+		SQLitePath:             t.TempDir() + "/app.db",
+		BackupEnabled:          true,
+		BackupDir:              t.TempDir() + "/backups",
+		BackupRetentionDays:    7,
+		RequestTimeout:         5 * time.Second,
+		LogLevel:               "info",
+		LogFileEnabled:         false,
+		LogRetentionDays:       7,
 	}
 }

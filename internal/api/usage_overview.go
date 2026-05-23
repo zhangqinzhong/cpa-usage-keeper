@@ -1,12 +1,16 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
-	"cpa-usage-keeper/internal/cpa"
+	"cpa-usage-keeper/internal/auth"
 	"cpa-usage-keeper/internal/redact"
+	repodto "cpa-usage-keeper/internal/repository/dto"
 	"cpa-usage-keeper/internal/service"
+	servicedto "cpa-usage-keeper/internal/service/dto"
+	"cpa-usage-keeper/internal/timeutil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -111,53 +115,113 @@ type usageOverviewModelSnapshot struct {
 	TotalTokens   int64 `json:"total_tokens"`
 }
 
-func registerUsageOverviewRoute(router gin.IRoutes, usageProvider service.UsageProvider) {
-	router.GET("/usage/overview", func(c *gin.Context) {
-		if usageProvider == nil {
-			c.JSON(http.StatusOK, usageOverviewResponse{
-				Usage:         buildUsageOverviewPayload(nil),
-				Summary:       usageOverviewSummary{},
-				Series:        emptyUsageOverviewSeries(),
-				HourlySeries:  emptyUsageOverviewSeries(),
-				DailySeries:   emptyUsageOverviewSeries(),
-				ServiceHealth: usageOverviewServiceHealth{BlockDetails: []usageOverviewServiceHealthBlock{}},
-				Timezone:      time.Local.String(),
-			})
+var allowedKeyOverviewRanges = map[string]struct{}{
+	"4h": {}, "8h": {}, "12h": {}, "24h": {}, "today": {}, "yesterday": {}, "7d": {}, "30d": {},
+}
+
+func registerKeyOverviewRoute(router gin.IRoutes, usageProvider service.UsageProvider, cpaAPIKeyProvider service.CPAAPIKeyProvider, authHandler *authHandler) {
+	router.GET("/key-overview", func(c *gin.Context) {
+		token, _ := c.Get("auth_token")
+		sessionValue, _ := c.Get("auth_session")
+		session, ok := sessionValue.(auth.Session)
+		if !ok || session.Role != auth.RoleAPIKeyViewer || session.CPAAPIKeyID <= 0 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
 		}
-
-		filter, err := parseUsageFilterQuery(c.Request, time.Now().UTC())
+		if cpaAPIKeyProvider == nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
+		if _, err := cpaAPIKeyProvider.FindActiveCPAAPIKeyByID(c.Request.Context(), session.CPAAPIKeyID); err != nil {
+			if authHandler != nil {
+				authHandler.deleteSession(fmt.Sprint(token))
+				clearSessionCookie(c, authHandler.config.BasePath)
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
+		filter, err := parseKeyOverviewFilterQuery(c.Request, timeutil.NormalizeStorageTime(time.Now()))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-
-		overview, err := usageProvider.GetUsageOverview(c.Request.Context(), filter)
-		if err != nil {
-			writeInternalError(c, "get usage overview failed", err)
+		if authHandler != nil && !authHandler.allowKeyOverviewRequest(fmt.Sprint(token)) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
 			return
 		}
+		filter.APIKeyID = fmt.Sprintf("%d", session.CPAAPIKeyID)
+		writeUsageOverviewResponse(c, usageProvider, filter)
+	})
+}
 
-		var usage *cpa.StatisticsSnapshot
-		if overview != nil {
-			usage = overview.Usage
+func registerUsageOverviewRoute(router gin.IRoutes, usageProvider service.UsageProvider) {
+	router.GET("/usage/overview", func(c *gin.Context) {
+		if usageProvider == nil {
+			writeUsageOverviewResponse(c, usageProvider, servicedto.UsageFilter{})
+			return
 		}
-		redactedUsage := redact.UsageSnapshot(usage)
+		filter, err := parseUsageFilterQuery(c.Request, timeutil.NormalizeStorageTime(time.Now()))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		writeUsageOverviewResponse(c, usageProvider, filter)
+	})
+}
+
+func parseKeyOverviewFilterQuery(req *http.Request, anchor time.Time) (servicedto.UsageFilter, error) {
+	query := req.URL.Query()
+	if query.Get("start") != "" || query.Get("end") != "" {
+		return servicedto.UsageFilter{}, fmt.Errorf("custom ranges are not supported")
+	}
+	rangeValue := query.Get("range")
+	if _, ok := allowedKeyOverviewRanges[rangeValue]; !ok {
+		return servicedto.UsageFilter{}, fmt.Errorf("unsupported key overview range %q", rangeValue)
+	}
+	return parseUsageFilterQuery(req, anchor)
+}
+
+func writeUsageOverviewResponse(c *gin.Context, usageProvider service.UsageProvider, filter servicedto.UsageFilter) {
+	if usageProvider == nil {
 		c.JSON(http.StatusOK, usageOverviewResponse{
-			Usage:         buildUsageOverviewPayload(redactedUsage),
-			Summary:       buildUsageOverviewSummary(overview),
-			Series:        buildUsageOverviewSeries(overview),
-			HourlySeries:  buildUsageOverviewHourlySeries(overview),
-			DailySeries:   buildUsageOverviewDailySeries(overview),
-			ServiceHealth: buildUsageOverviewServiceHealth(overview),
+			Usage:         buildUsageOverviewPayload(nil),
+			Summary:       usageOverviewSummary{},
+			Series:        emptyUsageOverviewSeries(),
+			HourlySeries:  emptyUsageOverviewSeries(),
+			DailySeries:   emptyUsageOverviewSeries(),
+			ServiceHealth: usageOverviewServiceHealth{BlockDetails: []usageOverviewServiceHealthBlock{}},
 			Timezone:      time.Local.String(),
 			RangeStart:    filter.StartTime,
 			RangeEnd:      filter.EndTime,
 		})
+		return
+	}
+
+	overview, err := usageProvider.GetUsageOverview(c.Request.Context(), filter)
+	if err != nil {
+		writeInternalError(c, "get usage overview failed", err)
+		return
+	}
+
+	var usage *repodto.StatisticsSnapshot
+	if overview != nil {
+		usage = overview.Usage
+	}
+	redactedUsage := redact.UsageSnapshot(usage)
+	c.JSON(http.StatusOK, usageOverviewResponse{
+		Usage:         buildUsageOverviewPayload(redactedUsage),
+		Summary:       buildUsageOverviewSummary(overview),
+		Series:        buildUsageOverviewSeries(overview),
+		HourlySeries:  buildUsageOverviewHourlySeries(overview),
+		DailySeries:   buildUsageOverviewDailySeries(overview),
+		ServiceHealth: buildUsageOverviewServiceHealth(overview),
+		Timezone:      time.Local.String(),
+		RangeStart:    filter.StartTime,
+		RangeEnd:      filter.EndTime,
 	})
 }
 
-func buildUsageOverviewPayload(snapshot *cpa.StatisticsSnapshot) usageOverviewPayload {
+func buildUsageOverviewPayload(snapshot *repodto.StatisticsSnapshot) usageOverviewPayload {
 	if snapshot == nil {
 		return usageOverviewPayload{
 			APIs:           map[string]usageOverviewAPISnapshot{},
@@ -203,7 +267,7 @@ func buildUsageOverviewPayload(snapshot *cpa.StatisticsSnapshot) usageOverviewPa
 	return payload
 }
 
-func buildUsageOverviewSummary(overview *service.UsageOverviewSnapshot) usageOverviewSummary {
+func buildUsageOverviewSummary(overview *servicedto.UsageOverviewSnapshot) usageOverviewSummary {
 	if overview == nil {
 		return usageOverviewSummary{}
 	}
@@ -239,7 +303,7 @@ func emptyUsageOverviewSeries() usageOverviewSeries {
 	}
 }
 
-func mapUsageOverviewSeriesLine(series service.UsageOverviewSeries) usageOverviewSeriesLine {
+func mapUsageOverviewSeriesLine(series servicedto.UsageOverviewSeries) usageOverviewSeriesLine {
 	return usageOverviewSeriesLine{
 		Requests:        cloneInt64Map(series.Requests),
 		Tokens:          cloneInt64Map(series.Tokens),
@@ -253,7 +317,7 @@ func mapUsageOverviewSeriesLine(series service.UsageOverviewSeries) usageOvervie
 	}
 }
 
-func mapUsageOverviewSeries(series service.UsageOverviewSeries) usageOverviewSeries {
+func mapUsageOverviewSeries(series servicedto.UsageOverviewSeries) usageOverviewSeries {
 	models := make(map[string]usageOverviewSeriesLine, len(series.Models))
 	for model, modelSeries := range series.Models {
 		models[model] = mapUsageOverviewSeriesLine(modelSeries)
@@ -272,28 +336,28 @@ func mapUsageOverviewSeries(series service.UsageOverviewSeries) usageOverviewSer
 	}
 }
 
-func buildUsageOverviewSeries(overview *service.UsageOverviewSnapshot) usageOverviewSeries {
+func buildUsageOverviewSeries(overview *servicedto.UsageOverviewSnapshot) usageOverviewSeries {
 	if overview == nil {
 		return emptyUsageOverviewSeries()
 	}
 	return mapUsageOverviewSeries(overview.Series)
 }
 
-func buildUsageOverviewHourlySeries(overview *service.UsageOverviewSnapshot) usageOverviewSeries {
+func buildUsageOverviewHourlySeries(overview *servicedto.UsageOverviewSnapshot) usageOverviewSeries {
 	if overview == nil {
 		return emptyUsageOverviewSeries()
 	}
 	return mapUsageOverviewSeries(overview.HourlySeries)
 }
 
-func buildUsageOverviewDailySeries(overview *service.UsageOverviewSnapshot) usageOverviewSeries {
+func buildUsageOverviewDailySeries(overview *servicedto.UsageOverviewSnapshot) usageOverviewSeries {
 	if overview == nil {
 		return emptyUsageOverviewSeries()
 	}
 	return mapUsageOverviewSeries(overview.DailySeries)
 }
 
-func buildUsageOverviewServiceHealth(overview *service.UsageOverviewSnapshot) usageOverviewServiceHealth {
+func buildUsageOverviewServiceHealth(overview *servicedto.UsageOverviewSnapshot) usageOverviewServiceHealth {
 	if overview == nil {
 		return usageOverviewServiceHealth{BlockDetails: []usageOverviewServiceHealthBlock{}}
 	}

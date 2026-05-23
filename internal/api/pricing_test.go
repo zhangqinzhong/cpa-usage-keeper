@@ -7,15 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	"cpa-usage-keeper/internal/models"
-	"cpa-usage-keeper/internal/service"
+	"cpa-usage-keeper/internal/entities"
+	servicedto "cpa-usage-keeper/internal/service/dto"
 )
 
 type pricingStub struct {
 	usedModels []string
-	pricing    []models.ModelPriceSetting
-	updated    *models.ModelPriceSetting
-	lastUpdate *service.UpdatePricingInput
+	pricing    []entities.ModelPriceSetting
+	updated    *entities.ModelPriceSetting
+	lastUpdate *servicedto.UpdatePricingInput
 	deleted    string
 	err        error
 }
@@ -24,11 +24,11 @@ func (s pricingStub) ListUsedModels(context.Context) ([]string, error) {
 	return s.usedModels, s.err
 }
 
-func (s pricingStub) ListPricing(context.Context) ([]models.ModelPriceSetting, error) {
+func (s pricingStub) ListPricing(context.Context) ([]entities.ModelPriceSetting, error) {
 	return s.pricing, s.err
 }
 
-func (s *pricingStub) UpdatePricing(_ context.Context, input service.UpdatePricingInput) (*models.ModelPriceSetting, error) {
+func (s *pricingStub) UpdatePricing(_ context.Context, input servicedto.UpdatePricingInput) (*entities.ModelPriceSetting, error) {
 	s.lastUpdate = &input
 	return s.updated, s.err
 }
@@ -39,7 +39,7 @@ func (s *pricingStub) DeletePricing(_ context.Context, model string) error {
 }
 
 func TestPricingRoutesReturnEmptyResponsesWithoutProvider(t *testing.T) {
-	router := NewRouter("", nil, nil, nil, nil, nil, AuthConfig{}, nil, "")
+	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "")
 
 	usedReq := httptest.NewRequest(http.MethodGet, "/api/v1/models/used", nil)
 	usedResp := httptest.NewRecorder()
@@ -57,9 +57,9 @@ func TestPricingRoutesReturnEmptyResponsesWithoutProvider(t *testing.T) {
 }
 
 func TestPricingRoutesReturnConfiguredData(t *testing.T) {
-	router := NewRouter("", nil, nil, nil, nil, &pricingStub{
+	router := NewRouter(nil, nil, nil, &pricingStub{
 		usedModels: []string{"claude-sonnet"},
-		pricing: []models.ModelPriceSetting{{
+		pricing: []entities.ModelPriceSetting{{
 			Model:                "claude-sonnet",
 			PromptPricePer1M:     3,
 			CompletionPricePer1M: 15,
@@ -84,14 +84,14 @@ func TestPricingRoutesReturnConfiguredData(t *testing.T) {
 
 func TestUpdatePricingRoute(t *testing.T) {
 	provider := &pricingStub{
-		updated: &models.ModelPriceSetting{
+		updated: &entities.ModelPriceSetting{
 			Model:                "claude-sonnet",
 			PromptPricePer1M:     3,
 			CompletionPricePer1M: 15,
 			CachePricePer1M:      0.3,
 		},
 	}
-	router := NewRouter("", nil, nil, nil, nil, provider, AuthConfig{}, nil, "")
+	router := NewRouter(nil, nil, nil, provider, AuthConfig{}, nil, "")
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/pricing/claude-sonnet", strings.NewReader(`{"prompt_price_per_1m":3,"completion_price_per_1m":15,"cache_price_per_1m":0.3}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -105,14 +105,14 @@ func TestUpdatePricingRoute(t *testing.T) {
 
 func TestUpdatePricingRouteAcceptsModelInBody(t *testing.T) {
 	provider := &pricingStub{
-		updated: &models.ModelPriceSetting{
+		updated: &entities.ModelPriceSetting{
 			Model:                "openai/gpt-4.1",
 			PromptPricePer1M:     3,
 			CompletionPricePer1M: 15,
 			CachePricePer1M:      0.3,
 		},
 	}
-	router := NewRouter("", nil, nil, nil, nil, provider, AuthConfig{}, nil, "")
+	router := NewRouter(nil, nil, nil, provider, AuthConfig{}, nil, "")
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/pricing", strings.NewReader(`{"model":"openai/gpt-4.1","prompt_price_per_1m":3,"completion_price_per_1m":15,"cache_price_per_1m":0.3}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -129,7 +129,7 @@ func TestUpdatePricingRouteAcceptsModelInBody(t *testing.T) {
 
 func TestDeletePricingRoute(t *testing.T) {
 	provider := &pricingStub{}
-	router := NewRouter("", nil, nil, nil, nil, provider, AuthConfig{}, nil, "")
+	router := NewRouter(nil, nil, nil, provider, AuthConfig{}, nil, "")
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pricing?model=openai%2Fgpt-4.1", nil)
 	resp := httptest.NewRecorder()

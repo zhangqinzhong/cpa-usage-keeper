@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildCustomDateRangeQuery, getOverviewChartEndMs, getOverviewDisplayLoading, getOverviewHourWindowHours, getTimeRangeOptions, getUsageTabOptions, refreshPageData, sanitizeRequestEventFilters, scheduleOverviewAutoRefresh, syncCpaData } from './UsagePage';
+import { buildCustomDateRangeQuery, getBackToCPALinkURL, getCustomDateRangeBounds, getOverviewChartEndMs, getOverviewDisplayLoading, getOverviewHourWindowHours, getPreferredOverviewChartPeriod, getTimeRangeOptions, getUsageTabOptions, isCustomDateWithinBounds, openDateInputPicker, refreshPageData, sanitizeRequestEventFilters, scheduleOverviewAutoRefresh, shouldAutoRefreshUsageTab, shouldShowApiKeyFilter, shouldShowRangeControls, shouldShowUpdateCheckButton, getUpdateCheckToastDuration } from './UsagePage';
 import { filterUsageByWindow, type UsageFilterWindow } from '@/utils/usage';
-import type { StatusResponse, UsageSnapshot } from '@/lib/types';
+import type { UsageSnapshot } from '@/lib/types';
 
 const usage: UsageSnapshot = {
   total_requests: 2,
@@ -91,6 +91,56 @@ describe('UsagePage Overview loading display', () => {
 
   it('shows loading before Overview data has loaded', () => {
     expect(getOverviewDisplayLoading({ loading: true, hasUsage: false })).toBe(true);
+  });
+});
+
+describe('UsagePage Back to CPA link', () => {
+  it('uses the CPA public URL from status', () => {
+    expect(getBackToCPALinkURL({ cpa_public_url: 'https://cpa.example.com' }, 'https://keeper.example.com')).toBe('https://cpa.example.com/management.html');
+  });
+
+  it('uses the current origin when status does not include a CPA public URL', () => {
+    expect(getBackToCPALinkURL({}, 'https://cpa.domain.com')).toBe('https://cpa.domain.com/management.html');
+    expect(getBackToCPALinkURL(null, 'https://cpa.domain.com')).toBe('https://cpa.domain.com/management.html');
+  });
+
+  it('normalizes trailing slashes and existing management pages', () => {
+    expect(getBackToCPALinkURL({ cpa_public_url: 'https://cpa.example.com/' }, 'https://keeper.example.com')).toBe('https://cpa.example.com/management.html');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'https://cpa.example.com/cpa/' }, 'https://keeper.example.com')).toBe('https://cpa.example.com/cpa/management.html');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'https://cpa.example.com/management.html' }, 'https://keeper.example.com')).toBe('https://cpa.example.com/management.html');
+  });
+
+  it('supports relative public paths and bare host names', () => {
+    expect(getBackToCPALinkURL({ cpa_public_url: '/cpa/' }, 'https://keeper.example.com')).toBe('https://keeper.example.com/cpa/management.html');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'cpa.domain.com/' }, 'https://keeper.example.com')).toBe('https://cpa.domain.com/management.html');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'cpa.domain.com:8317/' }, 'https://keeper.example.com')).toBe('https://cpa.domain.com:8317/management.html');
+  });
+
+  it('rejects explicit non-http public URL schemes', () => {
+    expect(getBackToCPALinkURL({ cpa_public_url: 'javascript://alert(1)' }, 'https://keeper.example.com')).toBe('');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'data://text/html,<script>alert(1)</script>' }, 'https://keeper.example.com')).toBe('');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'file:///etc/passwd' }, 'https://keeper.example.com')).toBe('');
+    expect(getBackToCPALinkURL({ cpa_public_url: 'ftp://cpa.example.com' }, 'https://keeper.example.com')).toBe('');
+  });
+});
+
+describe('UsagePage update check controls', () => {
+  it('hides the update button before status loads', () => {
+    expect(shouldShowUpdateCheckButton(null)).toBe(false);
+  });
+
+  it('hides the update button for dev builds', () => {
+    expect(shouldShowUpdateCheckButton({ updateCheckEnabled: false })).toBe(false);
+  });
+
+  it('shows the update button for release builds', () => {
+    expect(shouldShowUpdateCheckButton({ updateCheckEnabled: true })).toBe(true);
+  });
+
+  it('keeps failure toasts visible longer than success toasts', () => {
+    expect(getUpdateCheckToastDuration('success')).toBe(4_000);
+    expect(getUpdateCheckToastDuration('info')).toBe(4_000);
+    expect(getUpdateCheckToastDuration('error')).toBe(6_000);
   });
 });
 
@@ -185,6 +235,25 @@ describe('UsagePage Overview auto-refresh', () => {
   });
 });
 
+describe('UsagePage active tab auto-refresh guard', () => {
+  it('allows Request Events auto-refresh only on the first page', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'events', eventsPage: 1 })).toBe(true);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'events', eventsPage: 2 })).toBe(false);
+  });
+
+  it('does not auto-refresh Credentials', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1 })).toBe(false);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1 })).toBe(false);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1 })).toBe(false);
+  });
+
+  it('keeps Overview auto-refresh enabled and does not auto-refresh other tabs', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'overview', eventsPage: 2 })).toBe(true);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'analysis', eventsPage: 1 })).toBe(false);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'settings', eventsPage: 1 })).toBe(false);
+  });
+});
+
 describe('UsagePage range filtering bug', () => {
   it('changes the usage payload that summary metrics read from', () => {
     const filterWindow: UsageFilterWindow = {
@@ -206,12 +275,12 @@ describe('UsagePage request event filters', () => {
     const next = sanitizeRequestEventFilters(
       {
         model: 'claude-opus',
-        source: 'source-b',
+        source: 'authidx-source-b',
         result: 'failed',
       },
       {
         models: ['claude-sonnet'],
-        sources: [{ value: 'source-a', label: 'Provider A' }],
+        sources: [{ value: 'authidx-source-a', label: 'authidx-source-a' }],
       },
     );
 
@@ -221,14 +290,112 @@ describe('UsagePage request event filters', () => {
       result: 'failed',
     });
   });
+
+  it('keeps source filters that are still available after refreshing options', () => {
+    const next = sanitizeRequestEventFilters(
+      {
+        model: 'claude-sonnet',
+        source: 'authidx-source-a',
+        result: 'success',
+      },
+      {
+        models: ['claude-sonnet'],
+        sources: [{ value: 'authidx-source-a', label: 'authidx-source-a' }],
+      },
+    );
+
+    expect(next).toEqual({
+      model: 'claude-sonnet',
+      source: 'authidx-source-a',
+      result: 'success',
+    });
+  });
 });
 
+for (const [tab, expected] of [
+  ['overview', true],
+  ['analysis', true],
+  ['events', true],
+  ['credentials', false],
+  ['settings', false],
+] as const) {
+  it(`returns ${expected} for ${tab} range controls visibility`, () => {
+    expect(shouldShowRangeControls(tab)).toBe(expected);
+  });
+}
+
+for (const [tab, expected] of [
+  ['overview', true],
+  ['analysis', true],
+  ['events', true],
+  ['credentials', false],
+  ['settings', false],
+] as const) {
+  it(`returns ${expected} for ${tab} API Key filter visibility`, () => {
+    expect(shouldShowApiKeyFilter(tab)).toBe(expected);
+  });
+}
+
 describe('UsagePage time range options', () => {
-  it('places Today after 24h position and removes 24h from selectable ranges', () => {
+  it('includes rolling 24h, local Today, Yesterday, and 30d ranges', () => {
     const options = getTimeRangeOptions((key) => `translated:${key}`);
 
-    expect(options.map((option) => option.value)).toEqual(['4h', '8h', '12h', 'today', '7d', 'custom']);
+    expect(options.map((option) => option.value)).toEqual(['4h', '8h', '12h', '24h', 'today', 'yesterday', '7d', '30d', 'custom']);
+    expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_24h');
     expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_today');
+    expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_yesterday');
+    expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_30d');
+  });
+});
+
+describe('UsagePage Overview chart period preference', () => {
+  it('keeps sub-day windows on By Hour', () => {
+    expect(getPreferredOverviewChartPeriod({ windowMinutes: 12 * 60 })).toBe('hour');
+  });
+
+  it('uses By Day only for windows longer than one day without inspecting chart data', () => {
+    expect(getPreferredOverviewChartPeriod({ windowMinutes: 24 * 60 })).toBe('hour');
+    expect(getPreferredOverviewChartPeriod({ windowMinutes: (24 * 60) + 1 })).toBe('day');
+    expect(getPreferredOverviewChartPeriod({ windowMinutes: 30 * 24 * 60 })).toBe('day');
+  });
+});
+
+describe('UsagePage custom date input bounds', () => {
+  it('limits selectable Custom dates to today through the first day of the previous month', () => {
+    expect(getCustomDateRangeBounds(Date.parse('2026-05-13T12:00:00.000Z'), 'UTC')).toEqual({
+      min: '2026-04-01',
+      max: '2026-05-13',
+    });
+  });
+
+  it('uses the project timezone when deriving Custom date bounds', () => {
+    expect(getCustomDateRangeBounds(Date.parse('2026-05-13T06:30:00.000Z'), 'America/Los_Angeles')).toEqual({
+      min: '2026-04-01',
+      max: '2026-05-12',
+    });
+  });
+
+  it('rejects tomorrow and dates before the first day of the previous month', () => {
+    const bounds = { min: '2026-04-01', max: '2026-05-13' };
+
+    expect(isCustomDateWithinBounds('2026-05-13', bounds)).toBe(true);
+    expect(isCustomDateWithinBounds('2026-04-01', bounds)).toBe(true);
+    expect(isCustomDateWithinBounds('2026-05-14', bounds)).toBe(false);
+    expect(isCustomDateWithinBounds('2026-03-31', bounds)).toBe(false);
+  });
+
+  it('opens the native date picker when the date field is activated', () => {
+    const showPicker = vi.fn();
+
+    openDateInputPicker({ showPicker } as unknown as HTMLInputElement);
+
+    expect(showPicker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores browsers that reject programmatic date picker opening', () => {
+    const input = { showPicker: vi.fn(() => { throw new Error('not allowed') }) } as unknown as HTMLInputElement;
+
+    expect(() => openDateInputPicker(input)).not.toThrow();
   });
 });
 
@@ -251,7 +418,7 @@ describe('UsagePage custom date query', () => {
 });
 
 describe('UsagePage Overview chart window', () => {
-  it('uses the backend-resolved range end for Today hourly chart buckets', () => {
+  it('uses backend Today range start instead of browser-local midnight for chart buckets', () => {
     const filterWindow: UsageFilterWindow = {
       startMs: Date.parse('2026-04-23T00:00:00.000Z'),
       endMs: Date.parse('2026-04-23T12:34:56.000Z'),
@@ -263,8 +430,26 @@ describe('UsagePage Overview chart window', () => {
       timeRange: 'today',
       filterWindow,
       fallbackEndMs: filterWindow.endMs ?? 0,
+      resolvedRangeStartMs: Date.parse('2026-04-22T16:00:00.000Z'),
       resolvedRangeEndMs: Date.parse('2026-04-23T15:59:59.999Z'),
-    })).toBe(Date.parse('2026-04-23T15:59:59.999Z'));
+    })).toBe(Date.parse('2026-04-23T16:00:00.000Z'));
+  });
+
+  it('uses Yesterday hourly chart buckets through the next day boundary', () => {
+    const filterWindow: UsageFilterWindow = {
+      startMs: Date.parse('2026-04-23T00:00:00.000Z'),
+      endMs: Date.parse('2026-04-23T23:59:59.999Z'),
+      windowMinutes: 24 * 60,
+    };
+    const resolvedRangeEndMs = Date.parse('2026-04-23T23:59:59.999Z');
+
+    expect(getOverviewHourWindowHours({ timeRange: 'yesterday', filterWindow })).toBe(24);
+    expect(getOverviewChartEndMs({
+      timeRange: 'yesterday',
+      filterWindow,
+      fallbackEndMs: Date.parse('2026-04-24T12:34:56.000Z'),
+      resolvedRangeEndMs,
+    })).toBe(Date.parse('2026-04-24T00:00:00.000Z'));
   });
 });
 
@@ -277,7 +462,7 @@ describe('UsagePage tab labels', () => {
       'translated:usage_stats.tab_analysis',
       'translated:usage_stats.tab_events',
       'translated:usage_stats.tab_credentials',
-      'translated:usage_stats.tab_pricing',
+      'translated:usage_stats.tab_settings',
     ]);
   });
 });
@@ -285,53 +470,15 @@ describe('UsagePage tab labels', () => {
 describe('UsagePage refresh action', () => {
   it('reloads page data without triggering backend sync', async () => {
     let refreshCalls = 0;
-    let syncCalls = 0;
+    const syncCalls = 0;
 
     await refreshPageData({
       refreshActiveTab: async () => {
         refreshCalls += 1;
       },
-      triggerBackendSync: async () => {
-        syncCalls += 1;
-      },
     });
 
     expect(refreshCalls).toBe(1);
     expect(syncCalls).toBe(0);
-  });
-});
-
-describe('UsagePage sync action', () => {
-  it('triggers backend sync, refreshes active tab data, and reloads status', async () => {
-    const calls: string[] = [];
-    let receivedStatus: StatusResponse | null = null;
-    const syncStatus: StatusResponse = { running: true, sync_running: false, last_status: 'completed' };
-    const refreshedStatus: StatusResponse = {
-      running: true,
-      sync_running: false,
-      last_status: 'completed',
-      last_run_at: '2026-04-26T13:00:00.000Z',
-    };
-
-    await syncCpaData({
-      triggerBackendSync: async () => {
-        calls.push('sync');
-        return syncStatus;
-      },
-      refreshActiveTab: async () => {
-        calls.push('refresh');
-      },
-      refreshStatus: async () => {
-        calls.push('status');
-        return refreshedStatus;
-      },
-      onStatus: (status) => {
-        calls.push('set-status');
-        receivedStatus = status;
-      },
-    });
-
-    expect(calls).toEqual(['sync', 'refresh', 'status', 'set-status']);
-    expect(receivedStatus).toBe(refreshedStatus);
   });
 });

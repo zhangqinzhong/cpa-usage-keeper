@@ -15,10 +15,21 @@ import (
 )
 
 const (
-	DefaultTimeZone                  = "Asia/Shanghai"
-	RedisQueueKeyDefault             = cpa.ManagementUsageQueueKey
-	RedisQueueErrorBackoffDefault    = 10 * time.Second
-	RedisMetadataSyncIntervalDefault = 30 * time.Second
+	DefaultTimeZone               = "Asia/Shanghai"
+	RedisQueueKeyDefault          = cpa.ManagementUsageQueueKey
+	RedisQueueBatchSizeDefault    = 10000
+	RedisQueueErrorBackoffDefault = 10 * time.Second
+	MetadataSyncIntervalDefault   = 30 * time.Second
+)
+
+var (
+	DefaultWorkDir      = filepath.Join(".", "data")
+	DefaultSQLitePath   = filepath.Join(DefaultWorkDir, "app.db")
+	DefaultLogDir       = filepath.Join(DefaultWorkDir, "logs")
+	DefaultBackupDir    = filepath.Join(DefaultWorkDir, "backups")
+	workDirDatabaseName = filepath.Base(DefaultSQLitePath)
+	workDirLogsName     = filepath.Base(DefaultLogDir)
+	workDirBackupsName  = filepath.Base(DefaultBackupDir)
 )
 
 type Config struct {
@@ -26,16 +37,22 @@ type Config struct {
 	AppPort string
 	// AppBasePath 是 Web 服务部署子路径，空值表示根路径。
 	AppBasePath string
+	// CPAPublicURL 是浏览器访问 CPA 的公开地址；为空时前端按同源根路径跳转。
+	CPAPublicURL string
+	// TLSEnabled 控制是否以 HTTPS 模式启动 HTTP 服务。
+	TLSEnabled bool
+	// TLSCertFile 是 HTTPS 证书文件路径。
+	TLSCertFile string
+	// TLSKeyFile 是 HTTPS 私钥文件路径。
+	TLSKeyFile string
 	// CPABaseURL 是 CPA 服务基础地址。
 	CPABaseURL string
 	// CPAManagementKey 是访问 CPA 管理数据的密钥。
 	CPAManagementKey string
-	// PollInterval 是 legacy export 拉取间隔。
-	PollInterval time.Duration
-	// UsageSyncMode 决定使用 auto、redis 或 legacy_export；auto 会在启动时解析为一种有效模式。
-	UsageSyncMode string
 	// RedisQueueAddr 是 CPA management data stream 的 TCP 地址，空值时按 CPA_BASE_URL 推导。
 	RedisQueueAddr string
+	// RedisQueueTLS 控制是否使用 TLS 连接 Redis 队列。
+	RedisQueueTLS bool
 	// RedisQueueKey 是 CPA usage 队列名。
 	RedisQueueKey string
 	// RedisQueueBatchSize 是单次 Redis LPOP 最多拉取的消息数。
@@ -44,13 +61,15 @@ type Config struct {
 	RedisQueueIdleInterval time.Duration
 	// RedisQueueErrorBackoff 是 Redis 临时错误后的固定退避间隔。
 	RedisQueueErrorBackoff time.Duration
-	// RedisMetadataSyncInterval 是 Redis drain 模式下 metadata 的固定刷新间隔。
-	RedisMetadataSyncInterval time.Duration
+	// MetadataSyncInterval 是 auth files 和 provider metadata 的固定刷新间隔。
+	MetadataSyncInterval time.Duration
+	// WorkDir 是应用工作目录，数据库、日志和备份默认从这里派生。
+	WorkDir string
 	// SQLitePath 是 SQLite 数据库文件路径。
 	SQLitePath string
-	// BackupEnabled 控制是否保存原始 export 备份文件。
+	// BackupEnabled 控制是否保存 SQLite 数据库备份文件。
 	BackupEnabled bool
-	// BackupDir 是原始 export 备份目录。
+	// BackupDir 是 SQLite 数据库备份目录。
 	BackupDir string
 	// BackupInterval 是两次备份写入之间的最小间隔。
 	BackupInterval time.Duration
@@ -58,6 +77,8 @@ type Config struct {
 	BackupRetentionDays int
 	// RequestTimeout 是访问 CPA HTTP 和 Redis TCP 的超时时间。
 	RequestTimeout time.Duration
+	// TLSSkipVerify 控制是否跳过 CPA HTTPS 和 Redis 队列 TLS 的证书验证。
+	TLSSkipVerify bool
 	// LogLevel 是应用日志级别。
 	LogLevel string
 	// LogFileEnabled 控制是否写入持久化日志文件。
@@ -74,25 +95,32 @@ type Config struct {
 	AuthSessionTTL time.Duration
 }
 
+type LoadOptions struct {
+	EnvFile string
+}
+
+var executableDir = func() (string, error) {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(executablePath), nil
+}
+
 func LoadFromEnv() (*Config, error) {
-	if err := loadDotEnvIfPresent(); err != nil {
+	return Load(LoadOptions{})
+}
+
+func Load(options LoadOptions) (*Config, error) {
+	envBaseDir, err := loadDotEnv(options)
+	if err != nil {
 		return nil, err
 	}
 	if err := applyProjectTimeZone(); err != nil {
 		return nil, err
 	}
 
-	usageSyncMode := getString("USAGE_SYNC_MODE", "auto")
-	if usageSyncMode != "auto" && usageSyncMode != "redis" && usageSyncMode != "legacy_export" {
-		return nil, fmt.Errorf("USAGE_SYNC_MODE must be one of auto, redis, legacy_export")
-	}
-
-	pollInterval, err := getDuration("POLL_INTERVAL", 5*time.Minute)
-	if err != nil {
-		return nil, err
-	}
-
-	redisQueueBatchSize, err := getInt("REDIS_QUEUE_BATCH_SIZE", 1000)
+	redisQueueBatchSize, err := getInt("REDIS_QUEUE_BATCH_SIZE", RedisQueueBatchSizeDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -118,14 +146,20 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 
-	backupInterval, err := getDuration("BACKUP_INTERVAL", time.Hour)
+	backupInterval, err := getDuration("BACKUP_INTERVAL", 24*time.Hour)
 	if err != nil {
 		return nil, err
 	}
+	if backupInterval <= 0 {
+		return nil, fmt.Errorf("BACKUP_INTERVAL must be positive")
+	}
 
-	backupRetentionDays, err := getInt("BACKUP_RETENTION_DAYS", 30)
+	backupRetentionDays, err := getInt("BACKUP_RETENTION_DAYS", 7)
 	if err != nil {
 		return nil, err
+	}
+	if backupRetentionDays < 0 {
+		return nil, fmt.Errorf("BACKUP_RETENTION_DAYS must be non-negative")
 	}
 
 	logFileEnabled, err := getBool("LOG_FILE_ENABLED", true)
@@ -152,38 +186,59 @@ func LoadFromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	tlsEnabled, err := getBool("TLS_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsSkipVerify, err := getBool("TLS_SKIP_VERIFY", false)
+	if err != nil {
+		return nil, err
+	}
+
+	redisQueueTLS, err := getBool("REDIS_QUEUE_TLS", false)
+	if err != nil {
+		return nil, err
+	}
 
 	appBasePath, err := normalizeBasePath(strings.TrimSpace(os.Getenv("APP_BASE_PATH")))
 	if err != nil {
 		return nil, fmt.Errorf("APP_BASE_PATH is invalid: %w", err)
 	}
 
+	workDir := getString("WORK_DIR", DefaultWorkDir)
+
 	cfg := &Config{
-		AppPort:                   getString("APP_PORT", "8080"),
-		AppBasePath:               appBasePath,
-		CPABaseURL:                strings.TrimSpace(os.Getenv("CPA_BASE_URL")),
-		CPAManagementKey:          strings.TrimSpace(os.Getenv("CPA_MANAGEMENT_KEY")),
-		PollInterval:              pollInterval,
-		UsageSyncMode:             usageSyncMode,
-		RedisQueueAddr:            strings.TrimSpace(os.Getenv("REDIS_QUEUE_ADDR")),
-		RedisQueueKey:             RedisQueueKeyDefault,
-		RedisQueueBatchSize:       redisQueueBatchSize,
-		RedisQueueIdleInterval:    redisQueueIdleInterval,
-		RedisQueueErrorBackoff:    RedisQueueErrorBackoffDefault,
-		RedisMetadataSyncInterval: RedisMetadataSyncIntervalDefault,
-		SQLitePath:                getString("SQLITE_PATH", "/data/app.db"),
-		BackupEnabled:             backupEnabled,
-		BackupDir:                 getString("BACKUP_DIR", "/data/backups"),
-		BackupInterval:            backupInterval,
-		BackupRetentionDays:       backupRetentionDays,
-		RequestTimeout:            requestTimeout,
-		LogLevel:                  getString("LOG_LEVEL", "info"),
-		LogFileEnabled:            logFileEnabled,
-		LogDir:                    getString("LOG_DIR", "/data/logs"),
-		LogRetentionDays:          logRetentionDays,
-		AuthEnabled:               authEnabled,
-		LoginPassword:             strings.TrimSpace(os.Getenv("LOGIN_PASSWORD")),
-		AuthSessionTTL:            authSessionTTL,
+		AppPort:                getString("APP_PORT", "8080"),
+		AppBasePath:            appBasePath,
+		CPAPublicURL:           strings.TrimSpace(os.Getenv("CPA_PUBLIC_URL")),
+		TLSEnabled:             tlsEnabled,
+		TLSCertFile:            strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
+		TLSKeyFile:             strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
+		CPABaseURL:             strings.TrimSpace(os.Getenv("CPA_BASE_URL")),
+		CPAManagementKey:       strings.TrimSpace(os.Getenv("CPA_MANAGEMENT_KEY")),
+		RedisQueueAddr:         strings.TrimSpace(os.Getenv("REDIS_QUEUE_ADDR")),
+		RedisQueueTLS:          redisQueueTLS,
+		RedisQueueKey:          RedisQueueKeyDefault,
+		RedisQueueBatchSize:    redisQueueBatchSize,
+		RedisQueueIdleInterval: redisQueueIdleInterval,
+		RedisQueueErrorBackoff: RedisQueueErrorBackoffDefault,
+		MetadataSyncInterval:   MetadataSyncIntervalDefault,
+		WorkDir:                workDir,
+		SQLitePath:             filepath.Join(workDir, workDirDatabaseName),
+		BackupEnabled:          backupEnabled,
+		BackupDir:              filepath.Join(workDir, workDirBackupsName),
+		BackupInterval:         backupInterval,
+		BackupRetentionDays:    backupRetentionDays,
+		RequestTimeout:         requestTimeout,
+		TLSSkipVerify:          tlsSkipVerify,
+		LogLevel:               getString("LOG_LEVEL", "info"),
+		LogFileEnabled:         logFileEnabled,
+		LogDir:                 filepath.Join(workDir, workDirLogsName),
+		LogRetentionDays:       logRetentionDays,
+		AuthEnabled:            authEnabled,
+		LoginPassword:          strings.TrimSpace(os.Getenv("LOGIN_PASSWORD")),
+		AuthSessionTTL:         authSessionTTL,
 	}
 	if cfg.CPABaseURL == "" {
 		return nil, fmt.Errorf("CPA_BASE_URL is required")
@@ -194,6 +249,15 @@ func LoadFromEnv() (*Config, error) {
 	if cfg.AuthEnabled && cfg.LoginPassword == "" {
 		return nil, fmt.Errorf("LOGIN_PASSWORD is required when AUTH_ENABLED is true")
 	}
+	if cfg.TLSEnabled {
+		if cfg.TLSCertFile == "" {
+			return nil, fmt.Errorf("TLS_CERT_FILE is required when TLS_ENABLED is true")
+		}
+		if cfg.TLSKeyFile == "" {
+			return nil, fmt.Errorf("TLS_KEY_FILE is required when TLS_ENABLED is true")
+		}
+	}
+	cfg.resolveRelativePaths(envBaseDir)
 
 	return cfg, nil
 }
@@ -214,25 +278,80 @@ func applyProjectTimeZone() error {
 	return nil
 }
 
-func loadDotEnvIfPresent() error {
+func loadDotEnv(options LoadOptions) (string, error) {
+	if strings.TrimSpace(options.EnvFile) != "" {
+		return loadDotEnvFile(options.EnvFile, true)
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("get working directory: %w", err)
+		return "", fmt.Errorf("get working directory: %w", err)
 	}
-
-	dotEnvPath := filepath.Join(cwd, ".env")
-	if _, err := os.Stat(dotEnvPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+	if loaded, err := loadOptionalDotEnv(filepath.Join(cwd, ".env")); err != nil || loaded {
+		if loaded {
+			return cwd, err
 		}
-		return fmt.Errorf("stat .env: %w", err)
+		return "", err
 	}
 
-	if err := godotenv.Overload(dotEnvPath); err != nil {
-		return fmt.Errorf("load .env: %w", err)
+	exeDir, err := executableDir()
+	if err != nil {
+		return "", fmt.Errorf("get executable directory: %w", err)
 	}
+	loaded, err := loadOptionalDotEnv(filepath.Join(exeDir, ".env"))
+	if loaded {
+		return exeDir, err
+	}
+	return "", err
+}
 
-	return nil
+func loadOptionalDotEnv(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat .env: %w", err)
+	}
+	if err := godotenv.Overload(path); err != nil {
+		return false, fmt.Errorf("load .env: %w", err)
+	}
+	return true, nil
+}
+
+func loadDotEnvFile(path string, required bool) (string, error) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) && !required {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat env file: %w", err)
+	}
+	if err := godotenv.Overload(path); err != nil {
+		return "", fmt.Errorf("load env file: %w", err)
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve env file path: %w", err)
+	}
+	return filepath.Dir(absolutePath), nil
+}
+
+func (cfg *Config) resolveRelativePaths(baseDir string) {
+	if baseDir == "" {
+		return
+	}
+	cfg.WorkDir = resolveRelativePath(baseDir, cfg.WorkDir)
+	cfg.SQLitePath = resolveRelativePath(baseDir, cfg.SQLitePath)
+	cfg.LogDir = resolveRelativePath(baseDir, cfg.LogDir)
+	cfg.BackupDir = resolveRelativePath(baseDir, cfg.BackupDir)
+	cfg.TLSCertFile = resolveRelativePath(baseDir, cfg.TLSCertFile)
+	cfg.TLSKeyFile = resolveRelativePath(baseDir, cfg.TLSKeyFile)
+}
+
+func resolveRelativePath(baseDir, value string) string {
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(baseDir, value)
 }
 
 func normalizeBasePath(value string) (string, error) {

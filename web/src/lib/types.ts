@@ -1,15 +1,35 @@
+export type AuthRole = 'admin' | 'api_key_viewer'
+
+export interface AuthSessionAPIKeySummary {
+  display_key: string
+  alias?: string
+}
+
 export interface AuthSessionResponse {
   authenticated: boolean
+  role?: AuthRole
+  api_key?: AuthSessionAPIKeySummary
 }
 
 export interface StatusResponse {
   running: boolean
   sync_running: boolean
   timezone: string
+  version?: string
+  updateCheckEnabled?: boolean
+  cpa_public_url?: string
   last_run_at?: string
   last_error?: string
   last_warning?: string
   last_status?: string
+}
+
+export interface UpdateCheckResponse {
+  currentVersion: string
+  latestVersion: string
+  updateAvailable: boolean
+  canCompare: boolean
+  message: string
 }
 
 export interface UsageTokenStats {
@@ -27,7 +47,6 @@ export interface UsageDetail {
   source_raw?: string
   source_display?: string
   source_type?: string
-  source_key?: string
   auth_index: string
   failed: boolean
   tokens: UsageTokenStats
@@ -128,18 +147,21 @@ export interface UsageEventTokens {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
   total_tokens: number
 }
 
 export interface UsageEvent {
-  id?: number
+  id?: string
   timestamp: string
   model: string
+  reasoning_effort?: string
   source: string
   source_raw?: string
   source_type?: string
-  source_key?: string
   auth_index?: string
+  isDelete?: boolean
   failed: boolean
   latency_ms: number
   tokens: UsageEventTokens
@@ -148,67 +170,198 @@ export interface UsageEvent {
 export interface UsageSourceFilterOption {
   value: string
   label: string
+  displayName?: string
 }
 
 export interface UsageEventsResponse {
   events: UsageEvent[]
-  models: string[]
-  sources: UsageSourceFilterOption[]
   total_count: number
   page: number
   page_size: number
   total_pages: number
 }
 
-export interface UsageEventFilterOptionsResponse {
+export interface UsageEventModelFilterOptionsResponse {
   models: string[]
+}
+
+export interface UsageEventSourceFilterOptionsResponse {
   sources: UsageSourceFilterOption[]
 }
 
-export interface UsageCredential {
-  source: string
-  source_type?: string
-  source_key?: string
+export type UsageIdentityAuthType = 1 | 2
+
+export interface UsageIdentity {
+  id: string
+  name: string
+  displayName?: string
+  auth_type: UsageIdentityAuthType
+  auth_type_name: string
+  identity: string
+  type: string
+  provider: string
+  prefix: string
+  priority?: number
+  disabled: boolean
+  note?: string
+  plan_type?: string
+  active_start?: string
+  active_until?: string
+  total_requests: number
   success_count: number
   failure_count: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+  total_tokens: number
+  last_aggregated_usage_event_id: string
+  first_used_at?: string
+  last_used_at?: string
+  stats_updated_at?: string
+  is_deleted: boolean
+  created_at: string
+  updated_at: string
+  deleted_at?: string
+}
+
+export interface UsageIdentitiesResponse {
+  identities: UsageIdentity[]
+}
+
+export interface UsageIdentitiesPageResponse {
+  identities: UsageIdentity[]
   total_count: number
+  page: number
+  page_size: number
+  total_pages: number
 }
 
-export interface UsageCredentialsResponse {
-  credentials: UsageCredential[]
+export interface UsageQuotaWindow {
+  duration?: number
+  unit?: string
+  seconds?: number
 }
 
-export interface UsageAnalysisModel {
-  model: string
-  total_requests: number
-  success_count: number
-  failure_count: number
+export interface UsageQuotaRow {
+  key: string
+  label?: string
+  scope?: string
+  metric?: string
+  planType?: string
+  used?: number
+  limit?: number
+  remaining?: number
+  usedPercent?: number
+  remainingFraction?: number
+  allowed?: boolean
+  limitReached?: boolean
+  window?: UsageQuotaWindow
+  resetAt?: string
+  resetAfterSeconds?: number
+}
+
+export interface UsageQuotaCheckResponse {
+  id: string
+  quota: UsageQuotaRow[]
+}
+
+export interface UsageQuotaCacheResponse {
+  items: UsageQuotaCheckResponse[]
+}
+
+export interface UsageQuotaRefreshTaskResponse {
+  taskId: string
+  authIndex: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  quota?: UsageQuotaCheckResponse
+  error?: string
+  cachedAt?: string
+  expiresAt?: string
+}
+
+export interface UsageQuotaRefreshTaskID {
+  authIndex: string
+  taskId: string
+}
+
+export interface UsageQuotaRefreshRejectedAuthIndex {
+  authIndex: string
+  error: 'not_found' | 'not_auth_file' | 'unsupported' | 'duplicate' | 'invalid'
+}
+
+export interface UsageQuotaRefreshResponse {
+  tasks: UsageQuotaRefreshTaskID[]
+  rejected: UsageQuotaRefreshRejectedAuthIndex[]
+  accepted: number
+  skipped: number
+  limit: number
+}
+
+export interface AnalysisTokenUsageBucket {
+  bucket: string
   input_tokens: number
   output_tokens: number
-  reasoning_tokens: number
   cached_tokens: number
+  reasoning_tokens: number
   total_tokens: number
-  total_latency_ms: number
-  latency_sample_count: number
+  requests: number
 }
 
-export interface UsageAnalysisApi {
+export interface AnalysisCompositionItem {
+  key: string
+  label: string
+  total_tokens: number
+  requests: number
+  percent: number
+}
+
+export interface AnalysisHeatmapCell {
   api_key: string
-  display_name: string
-  total_requests: number
-  success_count: number
-  failure_count: number
-  input_tokens: number
-  output_tokens: number
-  reasoning_tokens: number
-  cached_tokens: number
+  model: string
   total_tokens: number
-  models: UsageAnalysisModel[]
+  requests: number
+  intensity: number
 }
 
-export interface UsageAnalysisResponse {
-  apis: UsageAnalysisApi[]
-  models: UsageAnalysisModel[]
+export interface AnalysisHeatmapPayload {
+  api_keys: string[]
+  models: string[]
+  cells: AnalysisHeatmapCell[]
+}
+
+export interface AnalysisResponse {
+  granularity: 'hourly' | 'daily'
+  timezone: string
+  range_start?: string
+  range_end?: string
+  token_usage: AnalysisTokenUsageBucket[]
+  api_key_composition: AnalysisCompositionItem[]
+  model_composition: AnalysisCompositionItem[]
+  auth_files_composition: AnalysisCompositionItem[]
+  ai_provider_composition: AnalysisCompositionItem[]
+  heatmap: AnalysisHeatmapPayload
+}
+
+export interface CpaApiKeySettingsItem {
+  id: string
+  keyAlias: string
+  displayKey: string
+  label: string
+  lastSyncedAt: string | null
+}
+
+export interface CpaApiKeyOption {
+  id: string
+  label: string
+}
+
+export interface CpaApiKeysResponse {
+  items: CpaApiKeySettingsItem[]
+}
+
+export interface CpaApiKeyOptionsResponse {
+  options: CpaApiKeyOption[]
 }
 
 export interface PricingEntry {
@@ -226,7 +379,9 @@ export interface PricingResponse {
   pricing: PricingEntry[]
 }
 
-export type UsageTimeRange = 'all' | '4h' | '8h' | '12h' | '24h' | 'today' | '7d' | 'custom'
+export type KeyOverviewTimeRange = '4h' | '8h' | '12h' | '24h' | 'today' | 'yesterday' | '7d' | '30d'
+
+export type UsageTimeRange = KeyOverviewTimeRange | 'custom'
 
 export interface UsageFilterWindow {
   startMs?: number

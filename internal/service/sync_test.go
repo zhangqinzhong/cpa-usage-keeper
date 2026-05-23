@@ -13,20 +13,26 @@ import (
 
 	"cpa-usage-keeper/internal/config"
 	"cpa-usage-keeper/internal/cpa"
-	"cpa-usage-keeper/internal/models"
+	"cpa-usage-keeper/internal/cpa/dto/authfiles"
+	"cpa-usage-keeper/internal/cpa/dto/cpaapikeys"
+	"cpa-usage-keeper/internal/cpa/dto/providerconfig"
+	"cpa-usage-keeper/internal/cpa/dto/response"
+	"cpa-usage-keeper/internal/entities"
 	"cpa-usage-keeper/internal/repository"
+	"cpa-usage-keeper/internal/repository/dto"
+	servicedto "cpa-usage-keeper/internal/service/dto"
 	"github.com/sirupsen/logrus"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
 
-type stubExportFetcher struct {
-	result          *cpa.ExportResult
-	err             error
-	authFilesResult *cpa.AuthFilesResult
+type stubMetadataFetcher struct {
+	authFilesResult *response.AuthFilesResult
 	authFilesErr    error
-	providerConfig  cpa.ProviderMetadataConfig
+	apiKeysResult   *response.ManagementAPIKeysResult
+	apiKeysErr      error
+	providerConfig  providerconfig.ProviderMetadataConfig
 	geminiErr       error
 	claudeErr       error
 	codexErr        error
@@ -35,604 +41,149 @@ type stubExportFetcher struct {
 	geminiNilResult bool
 }
 
-type stubBackupWriter struct {
-	path    string
-	payload []byte
-	err     error
-	calls   int
-}
-
-type stubBackupCleaner struct {
-	retentionDays int
-	now           time.Time
-	err           error
-	calls         int
-}
-
 type trackingMetadataFetcher struct {
 	authCalls   int
+	apiKeyCalls int
 	geminiCalls int
 	claudeCalls int
 	codexCalls  int
 	vertexCalls int
 	openAICalls int
 	authErr     error
+	apiKeysErr  error
 	providerErr error
 }
 
-func (s stubExportFetcher) FetchUsageExport(context.Context) (*cpa.ExportResult, error) {
-	return s.result, s.err
+type observingMetadataFetcher struct {
+	db                            *gorm.DB
+	usageEventsBeforeMetadataSync int64
 }
 
-func (s stubExportFetcher) FetchAuthFiles(context.Context) (*cpa.AuthFilesResult, error) {
+func (s stubMetadataFetcher) FetchAuthFiles(context.Context) (*response.AuthFilesResult, error) {
 	if s.authFilesResult != nil || s.authFilesErr != nil {
 		return s.authFilesResult, s.authFilesErr
 	}
-	return &cpa.AuthFilesResult{StatusCode: 200, Payload: cpa.AuthFilesResponse{}}, nil
+	return &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{}}, nil
 }
 
-func (s stubExportFetcher) FetchGeminiAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s stubMetadataFetcher) FetchManagementAPIKeys(context.Context) (*response.ManagementAPIKeysResult, error) {
+	if s.apiKeysResult != nil || s.apiKeysErr != nil {
+		return s.apiKeysResult, s.apiKeysErr
+	}
+	return &response.ManagementAPIKeysResult{StatusCode: 200}, nil
+}
+
+func (s stubMetadataFetcher) FetchGeminiAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	if s.geminiNilResult {
 		return nil, nil
 	}
 	return providerKeyConfigResult(s.providerConfig.GeminiAPIKeys, s.geminiErr)
 }
 
-func (s stubExportFetcher) FetchClaudeAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s stubMetadataFetcher) FetchClaudeAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	return providerKeyConfigResult(s.providerConfig.ClaudeAPIKeys, s.claudeErr)
 }
 
-func (s stubExportFetcher) FetchCodexAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s stubMetadataFetcher) FetchCodexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	return providerKeyConfigResult(s.providerConfig.CodexAPIKeys, s.codexErr)
 }
 
-func (s stubExportFetcher) FetchVertexAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s stubMetadataFetcher) FetchVertexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	return providerKeyConfigResult(s.providerConfig.VertexAPIKeys, s.vertexErr)
 }
 
-func (s stubExportFetcher) FetchOpenAICompatibility(context.Context) (*cpa.OpenAICompatibilityResult, error) {
+func (s stubMetadataFetcher) FetchOpenAICompatibility(context.Context) (*response.OpenAICompatibilityResult, error) {
 	return openAICompatibilityResult(s.providerConfig.OpenAICompatibility, s.openAIErr)
 }
 
-func providerKeyConfigResult(payload []cpa.ProviderKeyConfig, err error) (*cpa.ProviderKeyConfigResult, error) {
+func providerKeyConfigResult(payload []providerconfig.ProviderKeyConfig, err error) (*response.ProviderKeyConfigResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &cpa.ProviderKeyConfigResult{StatusCode: 200, Payload: payload}, nil
+	return &response.ProviderKeyConfigResult{StatusCode: 200, Payload: payload}, nil
 }
 
-func openAICompatibilityResult(payload []cpa.OpenAICompatibilityConfig, err error) (*cpa.OpenAICompatibilityResult, error) {
+func openAICompatibilityResult(payload []providerconfig.OpenAICompatibilityConfig, err error) (*response.OpenAICompatibilityResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &cpa.OpenAICompatibilityResult{StatusCode: 200, Payload: payload}, nil
+	return &response.OpenAICompatibilityResult{StatusCode: 200, Payload: payload}, nil
 }
 
-func (s *stubBackupWriter) Write(_ uint, _ time.Time, payload []byte) (string, error) {
-	s.calls++
-	s.payload = append([]byte(nil), payload...)
-	if s.err != nil {
-		return "", s.err
-	}
-	return s.path, nil
-}
-
-func (s *stubBackupCleaner) Cleanup(retentionDays int, now time.Time) (int, error) {
-	s.calls++
-	s.retentionDays = retentionDays
-	s.now = now
-	return 0, s.err
-}
-
-func (s *trackingMetadataFetcher) FetchAuthFiles(context.Context) (*cpa.AuthFilesResult, error) {
+func (s *trackingMetadataFetcher) FetchAuthFiles(context.Context) (*response.AuthFilesResult, error) {
 	s.authCalls++
 	if s.authErr != nil {
 		return nil, s.authErr
 	}
-	return &cpa.AuthFilesResult{StatusCode: 200, Payload: cpa.AuthFilesResponse{}}, nil
+	return &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{}}, nil
 }
 
-func (s *trackingMetadataFetcher) FetchGeminiAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s *trackingMetadataFetcher) FetchManagementAPIKeys(context.Context) (*response.ManagementAPIKeysResult, error) {
+	s.apiKeyCalls++
+	if s.apiKeysErr != nil {
+		return nil, s.apiKeysErr
+	}
+	return &response.ManagementAPIKeysResult{StatusCode: 200}, nil
+}
+
+func (s *trackingMetadataFetcher) FetchGeminiAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	s.geminiCalls++
 	return providerKeyConfigResult(nil, s.providerErr)
 }
 
-func (s *trackingMetadataFetcher) FetchClaudeAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s *trackingMetadataFetcher) FetchClaudeAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	s.claudeCalls++
 	return providerKeyConfigResult(nil, s.providerErr)
 }
 
-func (s *trackingMetadataFetcher) FetchCodexAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s *trackingMetadataFetcher) FetchCodexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	s.codexCalls++
 	return providerKeyConfigResult(nil, s.providerErr)
 }
 
-func (s *trackingMetadataFetcher) FetchVertexAPIKeys(context.Context) (*cpa.ProviderKeyConfigResult, error) {
+func (s *trackingMetadataFetcher) FetchVertexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
 	s.vertexCalls++
 	return providerKeyConfigResult(nil, s.providerErr)
 }
 
-func (s *trackingMetadataFetcher) FetchOpenAICompatibility(context.Context) (*cpa.OpenAICompatibilityResult, error) {
+func (s *trackingMetadataFetcher) FetchOpenAICompatibility(context.Context) (*response.OpenAICompatibilityResult, error) {
 	s.openAICalls++
 	return openAICompatibilityResult(nil, s.providerErr)
 }
 
+func (s *observingMetadataFetcher) FetchAuthFiles(context.Context) (*response.AuthFilesResult, error) {
+	if err := s.db.Model(&entities.UsageEvent{}).Count(&s.usageEventsBeforeMetadataSync).Error; err != nil {
+		return nil, err
+	}
+	return &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{}}, nil
+}
+
+func (s *observingMetadataFetcher) FetchManagementAPIKeys(context.Context) (*response.ManagementAPIKeysResult, error) {
+	return &response.ManagementAPIKeysResult{StatusCode: 200}, nil
+}
+
+func (s *observingMetadataFetcher) FetchGeminiAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
+	return providerKeyConfigResult(nil, nil)
+}
+
+func (s *observingMetadataFetcher) FetchClaudeAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
+	return providerKeyConfigResult(nil, nil)
+}
+
+func (s *observingMetadataFetcher) FetchCodexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
+	return providerKeyConfigResult(nil, nil)
+}
+
+func (s *observingMetadataFetcher) FetchVertexAPIKeys(context.Context) (*response.ProviderKeyConfigResult, error) {
+	return providerKeyConfigResult(nil, nil)
+}
+
+func (s *observingMetadataFetcher) FetchOpenAICompatibility(context.Context) (*response.OpenAICompatibilityResult, error) {
+	return openAICompatibilityResult(nil, nil)
+}
+
 func (s *trackingMetadataFetcher) providerCalls() int {
 	return s.geminiCalls + s.claudeCalls + s.codexCalls + s.vertexCalls + s.openAICalls
-}
-
-func TestSyncOncePersistsSnapshotAndEvents(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	body := []byte(`{"version":1,"exported_at":"2026-04-16T10:00:00Z","usage":{"apis":{"provider-a":{"models":{"claude-sonnet":{"details":[{"timestamp":"2026-04-16T09:30:00Z","latency_ms":123,"source":"codex-a","auth_index":"1","failed":false,"tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":5,"cached_tokens":0,"total_tokens":35}}]}}}}}}`)
-	backupWriter := &stubBackupWriter{path: "/tmp/export.json"}
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client: stubExportFetcher{
-			result: successfulExportResult(body),
-			authFilesResult: &cpa.AuthFilesResult{StatusCode: 200, Payload: cpa.AuthFilesResponse{Files: []cpa.AuthFile{{
-				AuthIndex: "1",
-				Name:      "Claude Desktop",
-				Email:     "user@example.com",
-				Type:      "claude",
-				Provider:  "anthropic",
-			}}}},
-		},
-		BackupEnabled: true,
-		BackupWriter:  backupWriter,
-	})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncOnce returned error: %v", err)
-	}
-	if result.Status != "completed" || result.HTTPStatus != 200 {
-		t.Fatalf("unexpected sync result: %+v", result)
-	}
-	if result.InsertedEvents != 1 || result.DedupedEvents != 0 {
-		t.Fatalf("unexpected sync counts: %+v", result)
-	}
-	if result.BackupFilePath != "/tmp/export.json" || backupWriter.calls != 1 {
-		t.Fatalf("expected backup file path to be recorded, got result=%+v calls=%d", result, backupWriter.calls)
-	}
-	if string(backupWriter.payload) != string(body) {
-		t.Fatalf("expected backup payload to match raw body, got %s", string(backupWriter.payload))
-	}
-
-	var snapshot models.SnapshotRun
-	if err := db.First(&snapshot, result.SnapshotRunID).Error; err != nil {
-		t.Fatalf("load snapshot run: %v", err)
-	}
-	if snapshot.Status != "completed" {
-		t.Fatalf("expected completed snapshot run, got %q", snapshot.Status)
-	}
-	if snapshot.PayloadHash == "" || snapshot.InsertedEvents != 1 {
-		t.Fatalf("unexpected snapshot values: %+v", snapshot)
-	}
-	if snapshot.BackupFilePath != "/tmp/export.json" {
-		t.Fatalf("expected snapshot backup path to be stored, got %q", snapshot.BackupFilePath)
-	}
-
-	var event models.UsageEvent
-	if err := db.First(&event).Error; err != nil {
-		t.Fatalf("load usage event: %v", err)
-	}
-	if event.SnapshotRunID != result.SnapshotRunID || event.Source != "codex-a" || event.TotalTokens != 35 {
-		t.Fatalf("unexpected usage event: %+v", event)
-	}
-
-	var authFile models.AuthFile
-	if err := db.First(&authFile).Error; err != nil {
-		t.Fatalf("load auth file: %v", err)
-	}
-	if authFile.AuthIndex != "1" || authFile.Email != "user@example.com" {
-		t.Fatalf("unexpected auth file: %+v", authFile)
-	}
-}
-
-func TestSyncOnceMarksFetchFailureOnSnapshotRun(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{
-		err: errors.New("management export request failed with status 401"),
-		result: &cpa.ExportResult{
-			StatusCode: 401,
-			Body:       []byte(`{"error":"unauthorized"}`),
-		},
-	})
-
-	result, err := service.SyncNow(context.Background())
-	if err == nil {
-		t.Fatal("expected sync error")
-	}
-	if result == nil || result.Status != "failed" || result.HTTPStatus != 401 {
-		t.Fatalf("unexpected sync result: %+v", result)
-	}
-
-	var snapshot models.SnapshotRun
-	if err := db.First(&snapshot, result.SnapshotRunID).Error; err != nil {
-		t.Fatalf("load snapshot run: %v", err)
-	}
-	if snapshot.Status != "failed" {
-		t.Fatalf("expected failed snapshot run, got %q", snapshot.Status)
-	}
-	if snapshot.ErrorMessage == "" {
-		t.Fatal("expected snapshot error message to be stored")
-	}
-}
-
-func TestSyncOnceReturnsAuthFilesFailureWithoutClearingExistingData(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	if err := repository.ReplaceAuthFiles(db, []repository.AuthFileInput{{
-		AuthIndex: "existing",
-		Email:     "existing@example.com",
-	}}); err != nil {
-		t.Fatalf("seed auth files: %v", err)
-	}
-
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{
-		result:       successfulExportResult([]byte(`{"version":1}`)),
-		authFilesErr: errors.New("management auth files request failed with status 503"),
-	})
-
-	result, err := service.SyncNow(context.Background())
-	if err == nil {
-		t.Fatal("expected auth files sync error")
-	}
-	if result == nil || result.Status != "completed_with_warnings" {
-		t.Fatalf("expected completed_with_warnings sync result with partial failure, got %+v", result)
-	}
-
-	files, listErr := repository.ListAuthFiles(db)
-	if listErr != nil {
-		t.Fatalf("list auth files: %v", listErr)
-	}
-	if len(files) != 1 || files[0].AuthIndex != "existing" {
-		t.Fatalf("expected existing auth files to remain available, got %+v", files)
-	}
-
-	var snapshot models.SnapshotRun
-	if err := db.First(&snapshot, result.SnapshotRunID).Error; err != nil {
-		t.Fatalf("load snapshot run: %v", err)
-	}
-	if snapshot.Status != "completed_with_warnings" || snapshot.ErrorMessage == "" {
-		t.Fatalf("expected completed_with_warnings snapshot with error message, got %+v", snapshot)
-	}
-}
-
-func TestSyncOnceDeduplicatesExistingEvents(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))})
-
-	first, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("first SyncOnce returned error: %v", err)
-	}
-	second, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("second SyncOnce returned error: %v", err)
-	}
-	if first.InsertedEvents != 1 || second.InsertedEvents != 0 || second.DedupedEvents != 1 {
-		t.Fatalf("unexpected dedup results: first=%+v second=%+v", first, second)
-	}
-}
-
-func TestSyncOnceDoesNotLogExpectedEventAlignmentMiss(t *testing.T) {
-	db, logs := openSyncTestDatabaseWithLogs(t)
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))})
-
-	if _, err := service.SyncNow(context.Background()); err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if strings.Contains(logs.String(), "record not found") {
-		t.Fatalf("expected normal event alignment miss not to be logged, got %s", logs.String())
-	}
-}
-
-func TestSyncOnceSkipsBackupWhenDisabled(t *testing.T) {
-	db, logs := openSyncTestDatabaseWithLogs(t)
-	backupWriter := &stubBackupWriter{path: "/tmp/export.json"}
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:       "https://cpa.example.com",
-		Client:        stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))},
-		BackupEnabled: false,
-		BackupWriter:  backupWriter,
-	})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncOnce returned error: %v", err)
-	}
-	if result.BackupFilePath != "" {
-		t.Fatalf("expected empty backup path, got %+v", result)
-	}
-	if backupWriter.calls != 0 {
-		t.Fatalf("expected backup writer not to be called, got %d", backupWriter.calls)
-	}
-	if strings.Contains(logs.String(), "/internal/repository/db.go:156 record not found") {
-		t.Fatalf("expected no backup snapshot lookup log when backup is disabled, got %s", logs.String())
-	}
-}
-
-func TestSyncOnceFiltersEventsOlderThanLocalWatermarkOverlap(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	seedTime := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	if _, _, err := repository.InsertUsageEvents(db, []models.UsageEvent{{
-		EventKey:      "seed-event",
-		SnapshotRunID: 1,
-		APIGroupKey:   "provider-a",
-		Model:         "claude-sonnet",
-		Timestamp:     seedTime,
-		Source:        "seed-source",
-		AuthIndex:     "1",
-		TotalTokens:   10,
-	}}); err != nil {
-		t.Fatalf("seed usage event: %v", err)
-	}
-
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{result: &cpa.ExportResult{
-		StatusCode: 200,
-		Payload: cpa.UsageExport{
-			Version:    1,
-			ExportedAt: seedTime.Add(time.Hour),
-			Usage: cpa.StatisticsSnapshot{APIs: map[string]cpa.APISnapshot{
-				"provider-a": {Models: map[string]cpa.ModelSnapshot{
-					"claude-sonnet": {Details: []cpa.RequestDetail{
-						{Timestamp: seedTime.Add(-48 * time.Hour), Source: "old-source", AuthIndex: "2", Tokens: cpa.TokenStats{InputTokens: 1, OutputTokens: 1}},
-						{Timestamp: seedTime.Add(-12 * time.Hour), Source: "recent-source", AuthIndex: "3", Tokens: cpa.TokenStats{InputTokens: 2, OutputTokens: 2}},
-					}},
-				}},
-			}},
-		},
-	}})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if result.InsertedEvents != 1 || result.DedupedEvents != 0 {
-		t.Fatalf("expected only recent event to be inserted, got %+v", result)
-	}
-
-	var count int64
-	if err := db.Model(&models.UsageEvent{}).Where("source = ?", "old-source").Count(&count).Error; err != nil {
-		t.Fatalf("count old filtered events: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("expected old event to be filtered out, found %d rows", count)
-	}
-	if err := db.Model(&models.UsageEvent{}).Where("source = ?", "recent-source").Count(&count).Error; err != nil {
-		t.Fatalf("count recent events: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("expected recent event to be inserted, found %d rows", count)
-	}
-}
-
-func TestSyncOnceKeepsOverlapWindowEventsForExistingDedupe(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	seedTime := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	seedTokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, TotalTokens: 35}
-	seedEvent := models.UsageEvent{
-		EventKey:        BuildEventKey("provider-a", "claude-sonnet", seedTime.Add(-2*time.Hour), "codex-a", "1", false, seedTokens),
-		SnapshotRunID:   1,
-		APIGroupKey:     "provider-a",
-		Model:           "claude-sonnet",
-		Timestamp:       seedTime.Add(-2 * time.Hour),
-		Source:          "codex-a",
-		AuthIndex:       "1",
-		TotalTokens:     35,
-		InputTokens:     10,
-		OutputTokens:    20,
-		ReasoningTokens: 5,
-	}
-	if _, _, err := repository.InsertUsageEvents(db, []models.UsageEvent{seedEvent}); err != nil {
-		t.Fatalf("seed usage event: %v", err)
-	}
-
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{result: &cpa.ExportResult{
-		StatusCode: 200,
-		Payload: cpa.UsageExport{
-			Version:    1,
-			ExportedAt: seedTime.Add(time.Hour),
-			Usage: cpa.StatisticsSnapshot{APIs: map[string]cpa.APISnapshot{
-				"provider-a": {Models: map[string]cpa.ModelSnapshot{
-					"claude-sonnet": {Details: []cpa.RequestDetail{{
-						Timestamp: seedTime.Add(-2 * time.Hour),
-						Source:    "codex-a",
-						AuthIndex: "1",
-						Tokens:    seedTokens,
-					}}},
-				}},
-			}},
-		},
-	}})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if result.InsertedEvents != 0 || result.DedupedEvents != 1 {
-		t.Fatalf("expected overlap event to reach dedupe path, got %+v", result)
-	}
-}
-
-func TestSyncOnceKeepsZeroTimestampEvents(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	seedTime := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	if _, _, err := repository.InsertUsageEvents(db, []models.UsageEvent{{
-		EventKey:      "seed-event",
-		SnapshotRunID: 1,
-		APIGroupKey:   "provider-a",
-		Model:         "claude-sonnet",
-		Timestamp:     seedTime,
-		Source:        "seed-source",
-		AuthIndex:     "1",
-		TotalTokens:   10,
-	}}); err != nil {
-		t.Fatalf("seed usage event: %v", err)
-	}
-
-	service := NewSyncServiceWithClient(db, "https://cpa.example.com", stubExportFetcher{result: &cpa.ExportResult{
-		StatusCode: 200,
-		Payload: cpa.UsageExport{
-			Version: 1,
-			Usage: cpa.StatisticsSnapshot{APIs: map[string]cpa.APISnapshot{
-				"provider-a": {Models: map[string]cpa.ModelSnapshot{
-					"claude-sonnet": {Details: []cpa.RequestDetail{{
-						Source:    "zero-ts-source",
-						AuthIndex: "5",
-						Tokens:    cpa.TokenStats{InputTokens: 3, OutputTokens: 4},
-					}}},
-				}},
-			}},
-		},
-	}})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if result.InsertedEvents != 1 {
-		t.Fatalf("expected zero timestamp event to be kept, got %+v", result)
-	}
-}
-
-func TestSyncOnceSkipsBackupWithinConfiguredInterval(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	body := []byte(`{"version":1,"exported_at":"2026-04-16T10:00:00Z","usage":{"apis":{"provider-a":{"models":{"claude-sonnet":{"details":[{"timestamp":"2026-04-16T09:30:00Z","latency_ms":123,"source":"codex-a","auth_index":"1","failed":false,"tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":5,"cached_tokens":0,"total_tokens":35}}]}}}}}}`)
-	backupWriter := &stubBackupWriter{path: "/tmp/export.json"}
-	now := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:        "https://cpa.example.com",
-		Client:         stubExportFetcher{result: successfulExportResult(body)},
-		BackupEnabled:  true,
-		BackupWriter:   backupWriter,
-		BackupInterval: time.Hour,
-		Now: func() time.Time {
-			return now
-		},
-	})
-
-	first, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("first SyncNow returned error: %v", err)
-	}
-	if first.BackupFilePath != "/tmp/export.json" {
-		t.Fatalf("expected first sync to write backup, got %+v", first)
-	}
-
-	now = now.Add(30 * time.Minute)
-	second, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("second SyncNow returned error: %v", err)
-	}
-
-	if second.BackupFilePath != "" {
-		t.Fatalf("expected second sync to skip backup, got %+v", second)
-	}
-	if backupWriter.calls != 1 {
-		t.Fatalf("expected backup writer to be called once, got %d", backupWriter.calls)
-	}
-
-	var snapshots []models.SnapshotRun
-	if err := db.Order("id ASC").Find(&snapshots).Error; err != nil {
-		t.Fatalf("load snapshot runs: %v", err)
-	}
-	if len(snapshots) != 2 {
-		t.Fatalf("expected 2 snapshot runs, got %d", len(snapshots))
-	}
-	if snapshots[0].BackupFilePath == "" {
-		t.Fatalf("expected first snapshot backup path to be recorded, got %+v", snapshots[0])
-	}
-	if snapshots[1].Status != "completed" || snapshots[1].BackupFilePath != "" {
-		t.Fatalf("expected second snapshot to complete without backup path, got %+v", snapshots[1])
-	}
-}
-
-func TestSyncOnceWritesBackupAgainAfterConfiguredInterval(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	backupWriter := &stubBackupWriter{path: "/tmp/export.json"}
-	now := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:        "https://cpa.example.com",
-		BackupEnabled:  true,
-		BackupWriter:   backupWriter,
-		BackupInterval: time.Hour,
-		Now: func() time.Time {
-			return now
-		},
-	})
-
-	service.client = stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))}
-	first, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("first SyncNow returned error: %v", err)
-	}
-
-	now = now.Add(time.Hour)
-	service.client = stubExportFetcher{result: successfulExportResult([]byte(`{"version":2}`))}
-	second, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("second SyncNow returned error: %v", err)
-	}
-
-	if first.BackupFilePath == "" || second.BackupFilePath == "" {
-		t.Fatalf("expected both syncs to write backups, got first=%+v second=%+v", first, second)
-	}
-	if backupWriter.calls != 2 {
-		t.Fatalf("expected backup writer to be called twice, got %d", backupWriter.calls)
-	}
-}
-
-func TestSyncOnceFailsWhenBackupWriteFails(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:       "https://cpa.example.com",
-		Client:        stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))},
-		BackupEnabled: true,
-		BackupWriter:  &stubBackupWriter{err: errors.New("disk full")},
-	})
-
-	_, err := service.SyncNow(context.Background())
-	if err == nil || err.Error() != "write backup: disk full" {
-		t.Fatalf("expected backup write error, got %v", err)
-	}
-
-	var snapshot models.SnapshotRun
-	if err := db.Last(&snapshot).Error; err != nil {
-		t.Fatalf("load snapshot run: %v", err)
-	}
-	if snapshot.Status != "failed" || snapshot.ErrorMessage != "disk full" {
-		t.Fatalf("unexpected snapshot after backup failure: %+v", snapshot)
-	}
-}
-
-func TestSyncOnceCleansBackupsAfterSuccessfulSync(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	backupWriter := &stubBackupWriter{path: "/tmp/export.json"}
-	backupCleaner := &stubBackupCleaner{}
-	now := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:             "https://cpa.example.com",
-		Client:              stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))},
-		BackupEnabled:       true,
-		BackupWriter:        backupWriter,
-		BackupRetentionDays: 3,
-		BackupCleaner:       backupCleaner,
-		Now: func() time.Time {
-			return now
-		},
-	})
-
-	_, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if backupCleaner.calls != 1 {
-		t.Fatalf("expected backup cleaner to be called once, got %d", backupCleaner.calls)
-	}
-	if backupCleaner.retentionDays != 3 || !backupCleaner.now.Equal(now) {
-		t.Fatalf("unexpected cleanup input: %+v", backupCleaner)
-	}
 }
 
 func TestPullRedisUsageInboxOnlyStoresPendingRows(t *testing.T) {
@@ -652,34 +203,27 @@ func TestPullRedisUsageInboxOnlyStoresPendingRows(t *testing.T) {
 		t.Fatalf("unexpected pull result: %+v", result)
 	}
 
-	var inbox models.RedisUsageInbox
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
-	if inbox.Status != repository.RedisUsageInboxStatusPending || inbox.UsageEventKey != "" || inbox.SnapshotRunID != nil {
+	if inbox.Status != repository.RedisUsageInboxStatusPending || inbox.UsageEventKey != "" {
 		t.Fatalf("expected pending inbox row without processing links, got %+v", inbox)
 	}
 	var eventCount int64
-	if err := db.Model(&models.UsageEvent{}).Count(&eventCount).Error; err != nil {
+	if err := db.Model(&entities.UsageEvent{}).Count(&eventCount).Error; err != nil {
 		t.Fatalf("count usage events: %v", err)
 	}
 	if eventCount != 0 {
 		t.Fatalf("expected pull not to write usage events, got %d", eventCount)
 	}
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected pull not to write snapshot runs, got %d", snapshotCount)
-	}
 }
 
 func TestProcessRedisUsageInboxPersistsEventsWithoutSnapshot(t *testing.T) {
 	db := openSyncTestDatabase(t)
-	rows, err := repository.InsertRedisUsageInboxMessages(db, []repository.RedisInboxInsert{{
+	rows, err := repository.InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{
 		QueueKey:   cpa.ManagementUsageQueueKey,
-		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"process-only","tokens":{"input_tokens":1,"output_tokens":2}}`,
+		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","endpoint":"/v1/messages","auth_type":"api_key","model":"sonnet","request_id":"process-only","tokens":{"input_tokens":1,"output_tokens":2}}`,
 		PoppedAt:   time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC),
 	}})
 	if err != nil {
@@ -690,37 +234,159 @@ func TestProcessRedisUsageInboxPersistsEventsWithoutSnapshot(t *testing.T) {
 		RedisQueue: staticRedisQueue{err: errors.New("redis should not be popped while processing inbox")},
 	})
 
-	result, err := service.ProcessRedisUsageInbox(context.Background(), false)
+	result, err := service.ProcessRedisUsageInbox(context.Background())
 	if err != nil {
 		t.Fatalf("ProcessRedisUsageInbox returned error: %v", err)
 	}
-	if result == nil || result.Status != "completed" || result.InsertedEvents != 1 || result.SnapshotRunID != 0 {
+	if result == nil || result.Status != "completed" || result.InsertedEvents != 1 {
 		t.Fatalf("unexpected process result: %+v", result)
 	}
-	var event models.UsageEvent
+	var event entities.UsageEvent
 	if err := db.First(&event).Error; err != nil {
 		t.Fatalf("load usage event: %v", err)
 	}
-	if event.EventKey != "process-only" || event.SnapshotRunID != 0 {
+	if event.EventKey != "process-only" {
 		t.Fatalf("expected Redis event without snapshot run id, got %+v", event)
 	}
-	var inbox models.RedisUsageInbox
+	if event.Provider != "claude" || event.Endpoint != "/v1/messages" || event.AuthType != "apikey" || event.RequestID != "process-only" {
+		t.Fatalf("expected Redis identity fields to persist, got %+v", event)
+	}
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox, rows[0].ID).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
-	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.SnapshotRunID != nil || inbox.UsageEventKey != "process-only" {
+	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.UsageEventKey != "process-only" {
 		t.Fatalf("expected processed inbox row without snapshot link, got %+v", inbox)
 	}
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
+	var checkpoint entities.UsageOverviewAggregationCheckpoint
+	if err := db.Where("name = ?", "overview").First(&checkpoint).Error; err != nil {
+		t.Fatalf("expected overview aggregation checkpoint after processing inbox: %v", err)
 	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected Redis processing not to write snapshot runs, got %d", snapshotCount)
+	if checkpoint.LastAggregatedUsageEventID != event.ID {
+		t.Fatalf("expected overview checkpoint to aggregate through event %d, got %+v", event.ID, checkpoint)
 	}
 }
 
-func TestSyncRedisBatchSkipsEmptyBatchWithoutSnapshotOrMetadata(t *testing.T) {
+func TestProcessRedisUsageInboxRollsBackEventsWhenProcessedMarkFails(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	if _, err := repository.InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{
+		QueueKey:   cpa.ManagementUsageQueueKey,
+		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"rollback-on-mark-failure","tokens":{"input_tokens":1,"output_tokens":2}}`,
+		PoppedAt:   time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC),
+	}}); err != nil {
+		t.Fatalf("seed inbox row: %v", err)
+	}
+	if err := db.Exec(`CREATE TRIGGER fail_processed_mark BEFORE UPDATE OF status ON redis_usage_inboxes WHEN NEW.status = 'processed' BEGIN SELECT RAISE(ABORT, 'processed mark failed'); END;`).Error; err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{BaseURL: "https://cpa.example.com"})
+
+	_, err := service.ProcessRedisUsageInbox(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "processed mark failed") {
+		t.Fatalf("expected processed mark failure, got %v", err)
+	}
+	var eventCount int64
+	if err := db.Model(&entities.UsageEvent{}).Count(&eventCount).Error; err != nil {
+		t.Fatalf("count usage events: %v", err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("expected usage event insert to roll back when inbox mark fails, got %d", eventCount)
+	}
+}
+
+func TestProcessRedisUsageInboxSkipsAggregationWhenInboxAndEventsAreEmpty(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{BaseURL: "https://cpa.example.com"})
+
+	result, err := service.ProcessRedisUsageInbox(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessRedisUsageInbox returned error: %v", err)
+	}
+	if result == nil || !result.Empty || result.Status != "empty" {
+		t.Fatalf("unexpected empty process result: %+v", result)
+	}
+	var checkpointCount int64
+	if err := db.Model(&entities.UsageOverviewAggregationCheckpoint{}).Where("name = ?", "overview").Count(&checkpointCount).Error; err != nil {
+		t.Fatalf("count overview aggregation checkpoint: %v", err)
+	}
+	if checkpointCount != 0 {
+		t.Fatalf("expected empty process without usage events not to create aggregation checkpoint, got %d", checkpointCount)
+	}
+}
+
+func TestProcessRedisUsageInboxRetriesOverviewAggregationWhenInboxIsEmpty(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	if _, _, err := repository.InsertUsageEvents(db, []entities.UsageEvent{{
+		EventKey: "stale-event", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC), TotalTokens: 10,
+	}}); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{BaseURL: "https://cpa.example.com"})
+
+	result, err := service.ProcessRedisUsageInbox(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessRedisUsageInbox returned error: %v", err)
+	}
+	if result == nil || !result.Empty || result.Status != "empty" {
+		t.Fatalf("unexpected empty process result: %+v", result)
+	}
+	var checkpoint entities.UsageOverviewAggregationCheckpoint
+	if err := db.Where("name = ?", "overview").First(&checkpoint).Error; err != nil {
+		t.Fatalf("expected overview aggregation checkpoint after empty process catch-up: %v", err)
+	}
+	if checkpoint.LastAggregatedUsageEventID == 0 {
+		t.Fatalf("expected empty process catch-up to aggregate stale usage events, got %+v", checkpoint)
+	}
+}
+
+func TestProcessRedisUsageInboxDoesNotFetchMetadata(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	metadata := &trackingMetadataFetcher{}
+	rows, err := repository.InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{
+		QueueKey:   cpa.ManagementUsageQueueKey,
+		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"redis-no-metadata","tokens":{"input_tokens":1,"output_tokens":2}}`,
+		PoppedAt:   time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC),
+	}})
+	if err != nil {
+		t.Fatalf("seed inbox row: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL:         "https://cpa.example.com",
+		MetadataFetcher: metadata,
+	})
+
+	result, err := service.ProcessRedisUsageInbox(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessRedisUsageInbox returned error: %v", err)
+	}
+	if result == nil || result.Status != "completed" || result.InsertedEvents != 1 {
+		t.Fatalf("unexpected process result: %+v", result)
+	}
+	if metadata.authCalls != 0 || metadata.providerCalls() != 0 {
+		t.Fatalf("expected redis processing not to fetch metadata, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
+	}
+	var inbox entities.RedisUsageInbox
+	if err := db.First(&inbox, rows[0].ID).Error; err != nil {
+		t.Fatalf("load inbox row: %v", err)
+	}
+	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.UsageEventKey != "redis-no-metadata" {
+		t.Fatalf("expected inbox row processed, got %+v", inbox)
+	}
+}
+
+func processPendingOrPulledRedisUsageForTest(t *testing.T, service *SyncService) (*servicedto.RedisBatchSyncResult, error) {
+	t.Helper()
+	result, err := service.ProcessRedisUsageInbox(context.Background())
+	if err != nil || result == nil || !result.Empty {
+		return result, err
+	}
+	if _, err := service.PullRedisUsageInbox(context.Background()); err != nil {
+		return &servicedto.RedisBatchSyncResult{Status: "failed"}, err
+	}
+	return service.ProcessRedisUsageInbox(context.Background())
+}
+
+func TestSplitRedisUsageSyncSkipsEmptyBatchWithoutSnapshotOrMetadata(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	metadata := &trackingMetadataFetcher{}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
@@ -729,9 +395,9 @@ func TestSyncRedisBatchSkipsEmptyBatchWithoutSnapshotOrMetadata(t *testing.T) {
 		MetadataFetcher: metadata,
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), true)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || !result.Empty || result.Status != "empty" {
 		t.Fatalf("expected empty redis batch result, got %+v", result)
@@ -740,16 +406,9 @@ func TestSyncRedisBatchSkipsEmptyBatchWithoutSnapshotOrMetadata(t *testing.T) {
 		t.Fatalf("expected metadata fetch to be skipped for empty batch, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
 	}
 
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected no snapshot runs for empty batch, got %d", snapshotCount)
-	}
 }
 
-func TestSyncRedisBatchPersistsNonEmptyBatchWithoutMetadata(t *testing.T) {
+func TestSplitRedisUsageSyncPersistsNonEmptyBatchWithoutMetadata(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	metadata := &trackingMetadataFetcher{}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
@@ -758,9 +417,9 @@ func TestSyncRedisBatchPersistsNonEmptyBatchWithoutMetadata(t *testing.T) {
 		MetadataFetcher: metadata,
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || result.Empty || result.Status != "completed" || result.InsertedEvents != 1 || result.DedupedEvents != 0 {
 		t.Fatalf("unexpected redis batch result: %+v", result)
@@ -769,30 +428,23 @@ func TestSyncRedisBatchPersistsNonEmptyBatchWithoutMetadata(t *testing.T) {
 		t.Fatalf("expected metadata fetch to be skipped, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
 	}
 
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected Redis batch not to create snapshot runs, got %d", snapshotCount)
-	}
-	var event models.UsageEvent
+	var event entities.UsageEvent
 	if err := db.First(&event).Error; err != nil {
 		t.Fatalf("load usage event: %v", err)
 	}
-	if event.EventKey != "redis-1" || event.SnapshotRunID != 0 {
+	if event.EventKey != "redis-1" {
 		t.Fatalf("unexpected usage event: %+v", event)
 	}
-	var inbox models.RedisUsageInbox
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
-	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.SnapshotRunID != nil || inbox.UsageEventKey != "redis-1" {
+	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.UsageEventKey != "redis-1" {
 		t.Fatalf("expected processed inbox row without snapshot link, got %+v", inbox)
 	}
 }
 
-func TestSyncRedisBatchPersistsValidRowsWhenBatchContainsMalformedMessage(t *testing.T) {
+func TestSplitRedisUsageSyncPersistsValidRowsWhenBatchContainsMalformedMessage(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL: "https://cpa.example.com",
@@ -802,7 +454,7 @@ func TestSyncRedisBatchPersistsValidRowsWhenBatchContainsMalformedMessage(t *tes
 		}},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err == nil || !strings.Contains(err.Error(), "decode redis usage message") {
 		t.Fatalf("expected decode warning, got %v", err)
 	}
@@ -810,7 +462,7 @@ func TestSyncRedisBatchPersistsValidRowsWhenBatchContainsMalformedMessage(t *tes
 		t.Fatalf("expected warning result with valid event persisted, got %+v", result)
 	}
 
-	var event models.UsageEvent
+	var event entities.UsageEvent
 	if err := db.First(&event).Error; err != nil {
 		t.Fatalf("load usage event: %v", err)
 	}
@@ -818,7 +470,7 @@ func TestSyncRedisBatchPersistsValidRowsWhenBatchContainsMalformedMessage(t *tes
 		t.Fatalf("unexpected usage event: %+v", event)
 	}
 
-	var inboxRows []models.RedisUsageInbox
+	var inboxRows []entities.RedisUsageInbox
 	if err := db.Order("id asc").Find(&inboxRows).Error; err != nil {
 		t.Fatalf("load inbox rows: %v", err)
 	}
@@ -833,14 +485,14 @@ func TestSyncRedisBatchPersistsValidRowsWhenBatchContainsMalformedMessage(t *tes
 	}
 }
 
-func TestSyncRedisBatchMarksMalformedOnlyBatchWithoutSnapshot(t *testing.T) {
+func TestSplitRedisUsageSyncMarksMalformedOnlyBatchWithoutSnapshot(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL:    "https://cpa.example.com",
 		RedisQueue: staticRedisQueue{messages: []string{`{bad-json}`}},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err == nil || !strings.Contains(err.Error(), "decode redis usage message") {
 		t.Fatalf("expected decode warning, got %v", err)
 	}
@@ -848,15 +500,7 @@ func TestSyncRedisBatchMarksMalformedOnlyBatchWithoutSnapshot(t *testing.T) {
 		t.Fatalf("expected warning result, got %+v", result)
 	}
 
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected no snapshot for malformed-only batch, got %d", snapshotCount)
-	}
-
-	var inbox models.RedisUsageInbox
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
@@ -865,10 +509,39 @@ func TestSyncRedisBatchMarksMalformedOnlyBatchWithoutSnapshot(t *testing.T) {
 	}
 }
 
-func TestSyncRedisBatchProcessesPendingInboxBeforePoppingRedis(t *testing.T) {
+func TestSplitRedisUsageSyncLogsErrorAndMarksDecodeFailedWhenRequestIDMissing(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	logs := captureSyncDebugLogs(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL:    "https://cpa.example.com",
+		RedisQueue: staticRedisQueue{messages: []string{`{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","tokens":{"input_tokens":1,"output_tokens":2}}`}},
+	})
+
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
+	if err == nil || !strings.Contains(err.Error(), "request_id is required") {
+		t.Fatalf("expected missing request_id warning, got %v", err)
+	}
+	if result == nil || result.Status != "completed_with_warnings" {
+		t.Fatalf("expected warning result, got %+v", result)
+	}
+
+	var inbox entities.RedisUsageInbox
+	if err := db.First(&inbox).Error; err != nil {
+		t.Fatalf("load inbox row: %v", err)
+	}
+	if inbox.Status != repository.RedisUsageInboxStatusDecodeFailed || !strings.Contains(inbox.LastError, "request_id is required") {
+		t.Fatalf("expected missing request_id decode_failed row, got %+v", inbox)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "level=error") || !strings.Contains(output, "redis usage message decode failed") || !strings.Contains(output, "request_id is required") {
+		t.Fatalf("expected missing request_id error log, got:\n%s", output)
+	}
+}
+
+func TestSplitRedisUsageSyncProcessesPendingInboxBeforePoppingRedis(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	poppedAt := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	rows, err := repository.InsertRedisUsageInboxMessages(db, []repository.RedisInboxInsert{{
+	rows, err := repository.InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{
 		QueueKey:   cpa.ManagementUsageQueueKey,
 		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"pending-1","tokens":{"input_tokens":1,"output_tokens":2}}`,
 		PoppedAt:   poppedAt,
@@ -881,22 +554,22 @@ func TestSyncRedisBatchProcessesPendingInboxBeforePoppingRedis(t *testing.T) {
 		RedisQueue: staticRedisQueue{err: errors.New("redis should not be popped while inbox is pending")},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || result.Status != "completed" || result.InsertedEvents != 1 {
 		t.Fatalf("expected pending inbox row to be processed, got %+v", result)
 	}
 
-	var event models.UsageEvent
+	var event entities.UsageEvent
 	if err := db.First(&event).Error; err != nil {
 		t.Fatalf("load usage event: %v", err)
 	}
 	if event.EventKey != "pending-1" {
 		t.Fatalf("unexpected usage event: %+v", event)
 	}
-	var inbox models.RedisUsageInbox
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox, rows[0].ID).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
@@ -905,14 +578,13 @@ func TestSyncRedisBatchProcessesPendingInboxBeforePoppingRedis(t *testing.T) {
 	}
 }
 
-func TestSyncRedisBatchDoesNotWatermarkFilterRedisInboxEvents(t *testing.T) {
+func TestSplitRedisUsageSyncDoesNotWatermarkFilterRedisInboxEvents(t *testing.T) {
 	db := openSyncTestDatabase(t)
-	if _, _, err := repository.InsertUsageEvents(db, []models.UsageEvent{{
-		EventKey:      "future-watermark",
-		SnapshotRunID: 1,
-		APIGroupKey:   "claude",
-		Model:         "sonnet",
-		Timestamp:     time.Date(2026, 4, 28, 8, 0, 0, 0, time.UTC),
+	if _, _, err := repository.InsertUsageEvents(db, []entities.UsageEvent{{
+		EventKey:    "future-watermark",
+		APIGroupKey: "claude",
+		Model:       "sonnet",
+		Timestamp:   time.Date(2026, 4, 28, 8, 0, 0, 0, time.UTC),
 	}}); err != nil {
 		t.Fatalf("seed future event: %v", err)
 	}
@@ -923,24 +595,24 @@ func TestSyncRedisBatchDoesNotWatermarkFilterRedisInboxEvents(t *testing.T) {
 		}},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || result.InsertedEvents != 1 {
 		t.Fatalf("expected old unique Redis event to insert despite watermark, got %+v", result)
 	}
 
-	var event models.UsageEvent
+	var event entities.UsageEvent
 	if err := db.Where("event_key = ?", "old-but-unique").First(&event).Error; err != nil {
 		t.Fatalf("load old unique Redis event: %v", err)
 	}
 }
 
-func TestSyncRedisBatchRetriesProcessFailedInboxBeforePoppingRedis(t *testing.T) {
+func TestSplitRedisUsageSyncRetriesProcessFailedInboxBeforePoppingRedis(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	poppedAt := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	rows, err := repository.InsertRedisUsageInboxMessages(db, []repository.RedisInboxInsert{{
+	rows, err := repository.InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{
 		QueueKey:   cpa.ManagementUsageQueueKey,
 		RawMessage: `{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"retry-process-failed","tokens":{"input_tokens":1,"output_tokens":2}}`,
 		PoppedAt:   poppedAt,
@@ -956,14 +628,14 @@ func TestSyncRedisBatchRetriesProcessFailedInboxBeforePoppingRedis(t *testing.T)
 		RedisQueue: staticRedisQueue{err: errors.New("redis should not be popped while process_failed inbox is retryable")},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || result.InsertedEvents != 1 {
 		t.Fatalf("expected process_failed row retry to insert, got %+v", result)
 	}
-	var inbox models.RedisUsageInbox
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox, rows[0].ID).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
@@ -972,140 +644,40 @@ func TestSyncRedisBatchRetriesProcessFailedInboxBeforePoppingRedis(t *testing.T)
 	}
 }
 
-func TestSyncNowInRedisModeUsesDurableInbox(t *testing.T) {
+func TestSplitRedisUsageSyncUsesDurableInbox(t *testing.T) {
 	db := openSyncTestDatabase(t)
+	metadata := &trackingMetadataFetcher{}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:       "https://cpa.example.com",
-		UsageSyncMode: "redis",
+		BaseURL: "https://cpa.example.com",
 		RedisQueue: staticRedisQueue{messages: []string{
 			`{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"sync-now-redis","tokens":{"input_tokens":1,"output_tokens":2}}`,
 		}},
-		MetadataFetcher: stubExportFetcher{},
+		MetadataFetcher: metadata,
 	})
 
-	result, err := service.SyncNow(context.Background())
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result == nil || result.InsertedEvents != 1 {
-		t.Fatalf("unexpected SyncNow result: %+v", result)
+		t.Fatalf("unexpected split Redis usage sync result: %+v", result)
 	}
-	var inbox models.RedisUsageInbox
+	if metadata.authCalls != 0 || metadata.providerCalls() != 0 {
+		t.Fatalf("expected split Redis usage sync not to fetch metadata, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
+	}
+	var inbox entities.RedisUsageInbox
 	if err := db.First(&inbox).Error; err != nil {
 		t.Fatalf("load inbox row: %v", err)
 	}
 	if inbox.Status != repository.RedisUsageInboxStatusProcessed || inbox.UsageEventKey != "sync-now-redis" {
-		t.Fatalf("expected SyncNow redis path to use inbox, got %+v", inbox)
+		t.Fatalf("expected split Redis usage sync redis path to use inbox, got %+v", inbox)
 	}
 }
 
-func TestLegacyThenRedisEquivalentRequestDedupesAcrossPaths(t *testing.T) {
+func TestSplitRedisUsageSyncKeepsDistinctRedisRequestIDsWithSameEventFields(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	timestamp := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	tokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
-	legacyService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client:  stubExportFetcher{result: equivalentExportResult("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens)},
-	})
-
-	first, err := legacyService.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("legacy SyncNow returned error: %v", err)
-	}
-	if first.InsertedEvents != 1 || first.DedupedEvents != 0 {
-		t.Fatalf("unexpected first sync result: %+v", first)
-	}
-	redisService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		RedisQueue: staticRedisQueue{messages: []string{
-			equivalentRedisMessage("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens, "redis-request-id"),
-		}},
-	})
-
-	second, err := redisService.SyncRedisBatch(context.Background(), false)
-	if err != nil {
-		t.Fatalf("redis SyncRedisBatch returned error: %v", err)
-	}
-	if second.InsertedEvents != 0 || second.DedupedEvents != 1 {
-		t.Fatalf("expected Redis duplicate to dedupe against legacy event, got %+v", second)
-	}
-	assertUsageEventCount(t, db, 1)
-}
-
-func TestRedisThenLegacyEquivalentRequestDedupesAcrossPaths(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	timestamp := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	tokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
-	redisService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		RedisQueue: staticRedisQueue{messages: []string{
-			equivalentRedisMessage("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens, "redis-request-id"),
-		}},
-	})
-
-	first, err := redisService.SyncRedisBatch(context.Background(), false)
-	if err != nil {
-		t.Fatalf("redis SyncRedisBatch returned error: %v", err)
-	}
-	if first.InsertedEvents != 1 || first.DedupedEvents != 0 {
-		t.Fatalf("unexpected first sync result: %+v", first)
-	}
-	legacyService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client:  stubExportFetcher{result: equivalentExportResult("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens)},
-	})
-
-	second, err := legacyService.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("legacy SyncNow returned error: %v", err)
-	}
-	if second.InsertedEvents != 0 || second.DedupedEvents != 1 {
-		t.Fatalf("expected legacy duplicate to dedupe against Redis event, got %+v", second)
-	}
-	assertUsageEventCount(t, db, 1)
-
-	var event models.UsageEvent
-	if err := db.First(&event).Error; err != nil {
-		t.Fatalf("load usage event: %v", err)
-	}
-	if event.EventKey != "redis-request-id" {
-		t.Fatalf("expected Redis request_id to be preserved, got %+v", event)
-	}
-}
-
-func TestSyncRedisBatchDedupesOnlyOneRedisRequestAgainstExistingLegacyCanonicalEvent(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	timestamp := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	tokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
-	legacyService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client:  stubExportFetcher{result: equivalentExportResult("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens)},
-	})
-	if _, err := legacyService.SyncNow(context.Background()); err != nil {
-		t.Fatalf("legacy SyncNow returned error: %v", err)
-	}
-	redisService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		RedisQueue: staticRedisQueue{messages: []string{
-			equivalentRedisMessage("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens, "redis-request-1"),
-			equivalentRedisMessage("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens, "redis-request-2"),
-		}},
-	})
-
-	result, err := redisService.SyncRedisBatch(context.Background(), false)
-	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
-	}
-	if result.InsertedEvents != 1 || result.DedupedEvents != 1 {
-		t.Fatalf("expected one Redis request to dedupe against legacy and one to remain distinct, got %+v", result)
-	}
-	assertUsageEventCount(t, db, 2)
-}
-
-func TestSyncRedisBatchKeepsDistinctRedisRequestIDsWithSameCanonicalFields(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	timestamp := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	tokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
+	tokens := dto.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL: "https://cpa.example.com",
 		RedisQueue: staticRedisQueue{messages: []string{
@@ -1114,9 +686,9 @@ func TestSyncRedisBatchKeepsDistinctRedisRequestIDsWithSameCanonicalFields(t *te
 		}},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	if result.InsertedEvents != 2 || result.DedupedEvents != 0 {
 		t.Fatalf("expected distinct Redis request IDs to insert separately, got %+v", result)
@@ -1124,42 +696,7 @@ func TestSyncRedisBatchKeepsDistinctRedisRequestIDsWithSameCanonicalFields(t *te
 	assertUsageEventCount(t, db, 2)
 }
 
-func TestSyncRedisBatchRecordsPersistedEventKeyForLegacyDuplicateInboxRow(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	timestamp := time.Date(2026, 4, 27, 8, 0, 0, 0, time.UTC)
-	tokens := cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, CachedTokens: 4, TotalTokens: 39}
-	legacyService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client:  stubExportFetcher{result: equivalentExportResult("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens)},
-	})
-	first, err := legacyService.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("legacy SyncNow returned error: %v", err)
-	}
-	redisService := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		RedisQueue: staticRedisQueue{messages: []string{
-			equivalentRedisMessage("external-api-key", "claude-sonnet", timestamp, "codex-a", "1", false, 123, tokens, "redis-request-id"),
-		}},
-	})
-
-	if _, err := redisService.SyncRedisBatch(context.Background(), false); err != nil {
-		t.Fatalf("redis SyncRedisBatch returned error: %v", err)
-	}
-	var event models.UsageEvent
-	if err := db.First(&event, "snapshot_run_id = ?", first.SnapshotRunID).Error; err != nil {
-		t.Fatalf("load legacy usage event: %v", err)
-	}
-	var inbox models.RedisUsageInbox
-	if err := db.First(&inbox).Error; err != nil {
-		t.Fatalf("load redis inbox row: %v", err)
-	}
-	if inbox.UsageEventKey != event.EventKey {
-		t.Fatalf("expected inbox to reference persisted event key %q, got %+v", event.EventKey, inbox)
-	}
-}
-
-func TestSyncRedisBatchWritesDebugLogsWithoutRawPayload(t *testing.T) {
+func TestSplitRedisUsageSyncWritesDebugLogsWithoutRawPayload(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	logs := captureSyncDebugLogs(t)
 
@@ -1170,9 +707,9 @@ func TestSyncRedisBatchWritesDebugLogsWithoutRawPayload(t *testing.T) {
 		}},
 	})
 
-	_, err := service.SyncRedisBatch(context.Background(), false)
+	_, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err != nil {
-		t.Fatalf("SyncRedisBatch returned error: %v", err)
+		t.Fatalf("split Redis usage sync returned error: %v", err)
 	}
 	output := logs.String()
 	for _, expected := range []string{
@@ -1189,53 +726,6 @@ func TestSyncRedisBatchWritesDebugLogsWithoutRawPayload(t *testing.T) {
 	}
 }
 
-func TestSyncOnceWritesCoreDebugLogsForLegacyPull(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	logs := captureSyncDebugLogs(t)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		Client:  stubExportFetcher{result: successfulExportResult([]byte(`{"version":1}`))},
-	})
-
-	_, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	output := logs.String()
-	for _, expected := range []string{
-		"legacy usage pull started",
-		"legacy usage pull finished",
-		"usage persistence started",
-		"usage events insert finished",
-		"snapshot run finalized",
-	} {
-		if !strings.Contains(output, expected) {
-			t.Fatalf("expected debug log %q in output:\n%s", expected, output)
-		}
-	}
-}
-
-func TestSyncRedisBatchReturnsMetadataWarningAfterPersistingEvents(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	metadata := &trackingMetadataFetcher{authErr: errors.New("metadata unavailable")}
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:         "https://cpa.example.com",
-		RedisQueue:      staticRedisQueue{messages: []string{`{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"redis-2","tokens":{"input_tokens":1,"output_tokens":2}}`}},
-		MetadataFetcher: metadata,
-	})
-
-	result, err := service.SyncRedisBatch(context.Background(), true)
-	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
-		t.Fatalf("expected metadata warning error, got %v", err)
-	}
-	if result == nil || result.Status != "completed_with_warnings" || result.InsertedEvents != 1 {
-		t.Fatalf("expected warning result with persisted event, got %+v", result)
-	}
-	if metadata.authCalls != 1 || metadata.providerCalls() != 5 {
-		t.Fatalf("expected metadata fetch once, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
-	}
-}
-
 func TestSyncMetadataRefreshesMetadataWithoutSnapshot(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	metadata := &trackingMetadataFetcher{}
@@ -1247,29 +737,354 @@ func TestSyncMetadataRefreshesMetadataWithoutSnapshot(t *testing.T) {
 	if err := service.SyncMetadata(context.Background()); err != nil {
 		t.Fatalf("SyncMetadata returned error: %v", err)
 	}
-	if metadata.authCalls != 1 || metadata.providerCalls() != 5 {
-		t.Fatalf("expected metadata fetch once, got auth=%d provider=%d", metadata.authCalls, metadata.providerCalls())
-	}
-	var snapshotCount int64
-	if err := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; err != nil {
-		t.Fatalf("count snapshot runs: %v", err)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected metadata sync not to create snapshots, got %d", snapshotCount)
+	if metadata.authCalls != 1 || metadata.apiKeyCalls != 1 || metadata.providerCalls() != 5 {
+		t.Fatalf("expected metadata fetch once, got auth=%d apiKeys=%d provider=%d", metadata.authCalls, metadata.apiKeyCalls, metadata.providerCalls())
 	}
 }
 
-func TestSyncMetadataPersistsProviderMetadataFromDedicatedEndpoints(t *testing.T) {
+func TestSyncMetadataWritesCPAAPIKeys(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL: "https://cpa.example.com",
-		MetadataFetcher: stubExportFetcher{providerConfig: cpa.ProviderMetadataConfig{
-			GeminiAPIKeys: []cpa.ProviderKeyConfig{{APIKey: "gemini-key", Prefix: "gemini-prefix", Name: "Gemini"}},
-			ClaudeAPIKeys: []cpa.ProviderKeyConfig{{APIKey: "claude-key", Prefix: "claude-prefix", Name: "Claude"}},
-			OpenAICompatibility: []cpa.OpenAICompatibilityConfig{{
-				Name:          "Custom OpenAI",
-				Prefix:        "custom-openai",
-				APIKeyEntries: []cpa.OpenAIApiKeyEntry{{APIKey: "custom-key"}},
+		MetadataFetcher: stubMetadataFetcher{apiKeysResult: &response.ManagementAPIKeysResult{
+			StatusCode: 200,
+			Payload:    cpaapikeys.ManagementAPIKeysResponse{APIKeys: []string{"sk-alpha123456", "sk-beta654321"}},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+
+	rows, err := repository.ListActiveCPAAPIKeys(db)
+	if err != nil {
+		t.Fatalf("ListActiveCPAAPIKeys returned error: %v", err)
+	}
+	if len(rows) != 2 || rows[0].DisplayKey != "sk-*********123456" || rows[0].KeyAlias != "" {
+		t.Fatalf("unexpected synced API key rows: %+v", rows)
+	}
+}
+
+func TestSyncMetadataAPIKeyFetchFailureDoesNotDeleteLocalKeys(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	if err := repository.SyncCPAAPIKeys(db, []string{"sk-alpha123456"}, time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("seed API keys: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL:         "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{apiKeysErr: errors.New("management unavailable")},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err == nil || !strings.Contains(err.Error(), "management unavailable") {
+		t.Fatalf("expected API key fetch warning, got %v", err)
+	}
+
+	rows, err := repository.ListActiveCPAAPIKeys(db)
+	if err != nil {
+		t.Fatalf("ListActiveCPAAPIKeys returned error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].APIKey != "sk-alpha123456" {
+		t.Fatalf("expected existing key to remain active after fetch failure, got %+v", rows)
+	}
+}
+
+func TestSyncMetadataWritesAuthFilesToUsageIdentities(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{authFilesResult: &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{Files: []authfiles.AuthFile{{
+			AuthIndex: "auth-1",
+			Name:      "Fallback Name",
+			Email:     "user@example.com",
+			Type:      "claude",
+			Provider:  "Claude",
+			Label:     "Label Name",
+			Prefix:    "auth-prefix",
+			Priority:  intPtr(6),
+			Disabled:  boolPtr(false),
+			Note:      strPtr("auth note"),
+		}, {
+			AuthIndex: "auth-2",
+			Name:      "Name Fallback",
+			Type:      "gemini",
+			Provider:  "Gemini",
+			Label:     "Label Fallback",
+		}, {
+			AuthIndex: "auth-3",
+			Name:      "Name Fallback",
+			Type:      "codex",
+			Provider:  "Codex",
+		}, {
+			AuthIndex: "auth-4",
+			Type:      "vertex",
+			Provider:  "Vertex",
+		}}}}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	first := byIdentity["auth-1"]
+	if first.Name != "user@example.com" || first.AuthType != entities.UsageIdentityAuthTypeAuthFile || first.AuthTypeName != "oauth" || first.Identity != "auth-1" || first.Type != "claude" || first.Provider != "Claude" || first.IsDeleted {
+		t.Fatalf("unexpected auth usage identity for auth-1: %+v", first)
+	}
+	if first.Prefix != "auth-prefix" || first.Priority == nil || *first.Priority != 6 || first.Disabled == nil || *first.Disabled || first.Note == nil || *first.Note != "auth note" {
+		t.Fatalf("expected auth sync metadata to persist, got %+v", first)
+	}
+	second := byIdentity["auth-2"]
+	if second.Name != "Label Fallback" || second.AuthTypeName != "oauth" || second.Identity != "auth-2" || second.Type != "gemini" || second.Provider != "Gemini" || second.IsDeleted {
+		t.Fatalf("unexpected auth usage identity for auth-2: %+v", second)
+	}
+	third := byIdentity["auth-3"]
+	if third.Name != "Name Fallback" || third.AuthTypeName != "oauth" || third.Identity != "auth-3" || third.Type != "codex" || third.Provider != "Codex" || third.IsDeleted {
+		t.Fatalf("unexpected auth usage identity for auth-3: %+v", third)
+	}
+	fourth := byIdentity["auth-4"]
+	if fourth.Name != "auth-4" || fourth.AuthTypeName != "oauth" || fourth.Identity != "auth-4" || fourth.Type != "vertex" || fourth.Provider != "Vertex" || fourth.IsDeleted {
+		t.Fatalf("unexpected auth usage identity for auth-4: %+v", fourth)
+	}
+	assertTableNotExists(t, db, "auth_files")
+}
+
+func TestSyncMetadataWritesCodexAuthFileIDTokenFieldsOnlyForCodex(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	activeStart := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	activeUntil := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	accountID := "acct_123"
+	ignoredAccountID := "acct_should_ignore"
+	planType := "team"
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{authFilesResult: &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{Files: []authfiles.AuthFile{{
+			AuthIndex: "codex-auth",
+			Email:     "codex@example.com",
+			Type:      "codex",
+			Provider:  "Codex",
+			IDToken: &authfiles.AuthFileIDToken{
+				AccountID:   &accountID,
+				ActiveStart: &activeStart,
+				ActiveUntil: &activeUntil,
+				PlanType:    &planType,
+			},
+		}, {
+			AuthIndex: "claude-auth",
+			Email:     "claude@example.com",
+			Type:      "claude",
+			Provider:  "Claude",
+			IDToken: &authfiles.AuthFileIDToken{
+				AccountID:   &ignoredAccountID,
+				ActiveStart: &activeStart,
+				ActiveUntil: &activeUntil,
+				PlanType:    &planType,
+			},
+		}, {
+			AuthIndex: "codex-no-token",
+			Email:     "codex-no-token@example.com",
+			Type:      "codex",
+			Provider:  "Codex",
+		}}}}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	codex := byIdentity["codex-auth"]
+	if codex.AccountID == nil || *codex.AccountID != "acct_123" || codex.PlanType == nil || *codex.PlanType != "team" || codex.ActiveStart == nil || !codex.ActiveStart.Equal(activeStart) || codex.ActiveUntil == nil || !codex.ActiveUntil.Equal(activeUntil) {
+		t.Fatalf("expected codex id_token fields to persist, got %+v", codex)
+	}
+	claude := byIdentity["claude-auth"]
+	if claude.AccountID != nil || claude.PlanType != nil || claude.ActiveStart != nil || claude.ActiveUntil != nil {
+		t.Fatalf("expected non-codex auth file to ignore id_token fields, got %+v", claude)
+	}
+	codexNoToken := byIdentity["codex-no-token"]
+	if codexNoToken.AccountID != nil || codexNoToken.PlanType != nil || codexNoToken.ActiveStart != nil || codexNoToken.ActiveUntil != nil {
+		t.Fatalf("expected codex auth file without id_token to keep nullable fields empty, got %+v", codexNoToken)
+	}
+}
+
+func TestSyncMetadataWritesProjectIDFromAuthFileProjectID(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{authFilesResult: &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{Files: []authfiles.AuthFile{{
+			AuthIndex: "gemini-project",
+			Type:      "gemini-cli",
+			Provider:  "Gemini",
+			ProjectID: "gemini-project-id",
+		}, {
+			AuthIndex: "antigravity-project",
+			Type:      "antigravity",
+			Provider:  "Antigravity",
+			ProjectID: "antigravity-project-id",
+		}, {
+			AuthIndex: "claude-no-project",
+			Type:      "claude",
+			Provider:  "Claude",
+			ProjectID: "ignored-project-id",
+		}}}}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	if projectID := byIdentity["gemini-project"].ProjectID; projectID == nil || *projectID != "gemini-project-id" {
+		t.Fatalf("expected gemini project_id to persist, got %+v", byIdentity["gemini-project"])
+	}
+	if projectID := byIdentity["antigravity-project"].ProjectID; projectID == nil || *projectID != "antigravity-project-id" {
+		t.Fatalf("expected antigravity project_id to persist, got %+v", byIdentity["antigravity-project"])
+	}
+	if projectID := byIdentity["claude-no-project"].ProjectID; projectID != nil {
+		t.Fatalf("expected unsupported auth file type to ignore project_id, got %+v", byIdentity["claude-no-project"])
+	}
+}
+
+func TestSyncMetadataWritesProviderMetadataToUsageIdentities(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "claude-key", Prefix: "claude-prefix", Name: "Claude Team", AuthIndex: "claude-auth-index", Priority: intPtr(2), Disabled: boolPtr(false), Note: strPtr("provider note")}},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	apiKey := byIdentity["claude-auth-index"]
+	if apiKey.Name != "Claude Team" || apiKey.AuthType != entities.UsageIdentityAuthTypeAIProvider || apiKey.AuthTypeName != "apikey" || apiKey.Identity != "claude-auth-index" || apiKey.Type != "claude" || apiKey.LookupKey != "claude-key" || apiKey.Prefix != "claude-prefix" || apiKey.Provider != "Claude Team" || apiKey.IsDeleted {
+		t.Fatalf("unexpected provider usage identity for api key: %+v", apiKey)
+	}
+	if apiKey.Priority == nil || *apiKey.Priority != 2 || apiKey.Disabled == nil || *apiKey.Disabled || apiKey.Note == nil || *apiKey.Note != "provider note" {
+		t.Fatalf("expected provider sync metadata to persist, got %+v", apiKey)
+	}
+	if _, ok := byIdentity["claude-prefix"]; ok {
+		t.Fatalf("expected provider prefix not to be stored as usage identity, got %+v", byIdentity["claude-prefix"])
+	}
+	assertTableNotExists(t, db, "provider_metadata")
+}
+
+func TestSyncMetadataStoresProviderBaseURLWithoutOverwritingNameOrProvider(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			CodexAPIKeys: []providerconfig.ProviderKeyConfig{
+				{APIKey: "codex-key-a", BaseURL: "https://api.openai.com/v1", AuthIndex: "codex-auth-a"},
+				{APIKey: "codex-key-b", Name: "Codex Team", BaseURL: "https://chatgpt.com/backend-api/codex/", AuthIndex: "codex-auth-b"},
+			},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	unnamed := byIdentity["codex-auth-a"]
+	if unnamed.Name != "codex" || unnamed.Provider != "codex" || unnamed.BaseURL != "https://api.openai.com/v1" {
+		t.Fatalf("expected unnamed codex to keep provider identity and store base URL separately, got %+v", unnamed)
+	}
+	named := byIdentity["codex-auth-b"]
+	if named.Name != "Codex Team" || named.Provider != "Codex Team" || named.BaseURL != "https://chatgpt.com/backend-api/codex/" {
+		t.Fatalf("expected named codex to keep name/provider and store base URL separately, got %+v", named)
+	}
+}
+
+func TestSyncMetadataStoresOpenAICompatibilityBaseURL(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			OpenAICompatibility: []providerconfig.OpenAICompatibilityConfig{
+				{
+					Name:     "OpenRouter",
+					Prefix:   "openrouter",
+					BaseURL:  "https://openrouter.ai/api/v1",
+					Priority: intPtr(9),
+					Disabled: boolPtr(true),
+					Note:     strPtr("shared openai provider"),
+					APIKeyEntries: []providerconfig.OpenAIApiKeyEntry{
+						{APIKey: "openrouter-key", AuthIndex: "openrouter-auth"},
+						{APIKey: "openrouter-key-2", AuthIndex: "openrouter-auth-2"},
+					},
+				},
+			},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	identity := byIdentity["openrouter-auth"]
+	if identity.Name != "OpenRouter" || identity.Provider != "OpenRouter" || identity.Type != "openai" || identity.BaseURL != "https://openrouter.ai/api/v1" {
+		t.Fatalf("expected openai compatibility identity to keep name/provider/type and store base URL, got %+v", identity)
+	}
+	if identity.Priority == nil || *identity.Priority != 9 || identity.Disabled == nil || !*identity.Disabled || identity.Note == nil || *identity.Note != "shared openai provider" {
+		t.Fatalf("expected openai compatibility provider-level sync metadata to persist, got %+v", identity)
+	}
+	second := byIdentity["openrouter-auth-2"]
+	if second.Priority == nil || *second.Priority != 9 || second.Disabled == nil || !*second.Disabled || second.Note == nil || *second.Note != "shared openai provider" {
+		t.Fatalf("expected openai compatibility metadata to apply to every entry, got %+v", second)
+	}
+}
+
+func TestSyncMetadataKeepsProviderIdentityWhenPrefixEqualsAPIKey(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "same-value", Prefix: "same-value", Name: "Claude Same", AuthIndex: "same-auth-index"}},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	var identity entities.UsageIdentity
+	if err := db.Where("auth_type = ? AND identity = ?", entities.UsageIdentityAuthTypeAIProvider, "same-auth-index").First(&identity).Error; err != nil {
+		t.Fatalf("load protected api key usage identity: %v", err)
+	}
+	if identity.IsDeleted || identity.Type != "claude" || identity.Provider != "Claude Same" || identity.LookupKey != "same-value" {
+		t.Fatalf("expected api key matching prefix to remain active, got %+v", identity)
+	}
+}
+
+func TestSyncMetadataDoesNotUseOpenAICompatibilityPrefixAsDisplayName(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			OpenAICompatibility: []providerconfig.OpenAICompatibilityConfig{{
+				Prefix:        "https://proxy.internal/v1",
+				APIKeyEntries: []providerconfig.OpenAIApiKeyEntry{{APIKey: "openai-compatible-key", AuthIndex: "openai-compatible-auth-index"}},
 			}},
 		}},
 	})
@@ -1277,59 +1092,50 @@ func TestSyncMetadataPersistsProviderMetadataFromDedicatedEndpoints(t *testing.T
 	if err := service.SyncMetadata(context.Background()); err != nil {
 		t.Fatalf("SyncMetadata returned error: %v", err)
 	}
-	items, err := repository.ListProviderMetadata(db)
+	items, err := repository.ListUsageIdentities(context.Background(), db)
 	if err != nil {
-		t.Fatalf("list provider metadata: %v", err)
+		t.Fatalf("list usage identities: %v", err)
 	}
-	if len(items) != 6 {
-		t.Fatalf("expected provider metadata rows from dedicated endpoints, got %+v", items)
+	byIdentity := usageIdentitiesByIdentity(items)
+	identity := byIdentity["openai-compatible-auth-index"]
+	if identity.Identity != "openai-compatible-auth-index" || identity.LookupKey != "openai-compatible-key" {
+		t.Fatalf("expected OpenAI compatibility api key usage identity, got %+v", identity)
 	}
-}
-
-func TestSyncMetadataPersistsSuccessfulProviderMetadataWhenOneEndpointFails(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL: "https://cpa.example.com",
-		MetadataFetcher: stubExportFetcher{
-			providerConfig: cpa.ProviderMetadataConfig{ClaudeAPIKeys: []cpa.ProviderKeyConfig{{APIKey: "claude-key", Prefix: "claude-prefix", Name: "Claude"}}},
-			geminiErr:      errors.New("gemini unavailable"),
-		},
-	})
-
-	err := service.SyncMetadata(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "gemini unavailable") {
-		t.Fatalf("expected provider metadata warning, got %v", err)
+	if identity.Name != "openai" || identity.Provider != "openai" || identity.Prefix != "https://proxy.internal/v1" {
+		t.Fatalf("expected raw OpenAI compatibility prefix to be stored only as prefix metadata, got %+v", identity)
 	}
-	items, listErr := repository.ListProviderMetadata(db)
-	if listErr != nil {
-		t.Fatalf("list provider metadata: %v", listErr)
-	}
-	if len(items) != 2 || items[0].ProviderType != "claude" {
-		t.Fatalf("expected successful provider metadata to persist, got %+v", items)
+	if _, ok := byIdentity["https://proxy.internal/v1"]; ok {
+		t.Fatalf("expected OpenAI compatibility prefix not to create usage identity, got %+v", items)
 	}
 }
 
-func TestSyncMetadataKeepsFailedProviderRowsDuringPartialFailure(t *testing.T) {
+func TestSyncMetadataUsageIdentityPartialFailureKeepsFailedProviderType(t *testing.T) {
 	db := openSyncTestDatabase(t)
-	if err := repository.ReplaceProviderMetadata(db, []repository.ProviderMetadataInput{{
-		LookupKey:    "old-gemini-key",
-		ProviderType: "gemini",
-		DisplayName:  "Old Gemini",
-		ProviderKey:  "gemini:Old Gemini",
-		MatchKind:    "api_key",
+	now := time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	oldDeletedAt := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+	if err := db.Create(&[]entities.UsageIdentity{{
+		Name:         "Old Gemini",
+		AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+		AuthTypeName: "apikey",
+		Identity:     "old-gemini-key",
+		Type:         "gemini",
+		Provider:     "Old Gemini",
 	}, {
-		LookupKey:    "old-claude-key",
-		ProviderType: "claude",
-		DisplayName:  "Old Claude",
-		ProviderKey:  "claude:Old Claude",
-		MatchKind:    "api_key",
-	}}); err != nil {
-		t.Fatalf("seed provider metadata: %v", err)
+		Name:         "Old Claude",
+		AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+		AuthTypeName: "apikey",
+		Identity:     "old-claude-key",
+		Type:         "claude",
+		Provider:     "Old Claude",
+		DeletedAt:    &oldDeletedAt,
+	}}).Error; err != nil {
+		t.Fatalf("seed usage identities: %v", err)
 	}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL: "https://cpa.example.com",
-		MetadataFetcher: stubExportFetcher{
-			providerConfig: cpa.ProviderMetadataConfig{ClaudeAPIKeys: []cpa.ProviderKeyConfig{{APIKey: "new-claude-key", Prefix: "new-claude-prefix", Name: "New Claude"}}},
+		Now:     func() time.Time { return now },
+		MetadataFetcher: stubMetadataFetcher{
+			providerConfig: providerconfig.ProviderMetadataConfig{ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "new-claude-key", Prefix: "new-claude-prefix", Name: "New Claude", AuthIndex: "new-claude-auth-index"}}},
 			geminiErr:      errors.New("gemini unavailable"),
 		},
 	})
@@ -1338,95 +1144,235 @@ func TestSyncMetadataKeepsFailedProviderRowsDuringPartialFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "gemini unavailable") {
 		t.Fatalf("expected provider metadata warning, got %v", err)
 	}
-	items, listErr := repository.ListProviderMetadata(db)
+	items, listErr := repository.ListUsageIdentities(context.Background(), db)
 	if listErr != nil {
-		t.Fatalf("list provider metadata: %v", listErr)
+		t.Fatalf("list usage identities: %v", listErr)
 	}
-	lookupKeys := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		lookupKeys[item.LookupKey] = struct{}{}
+	byIdentity := usageIdentitiesByIdentity(items)
+	if oldGemini := byIdentity["old-gemini-key"]; oldGemini.Identity == "" || oldGemini.IsDeleted || oldGemini.DeletedAt != nil {
+		t.Fatalf("expected failed gemini identity to remain untouched, got %+v", oldGemini)
 	}
-	for _, expected := range []string{"old-gemini-key", "new-claude-key", "new-claude-prefix"} {
-		if _, ok := lookupKeys[expected]; !ok {
-			t.Fatalf("expected provider metadata %q to exist after partial failure, got %+v", expected, items)
+	if oldClaude := byIdentity["old-claude-key"]; oldClaude.Identity == "" || !oldClaude.IsDeleted || oldClaude.DeletedAt == nil || !oldClaude.DeletedAt.Equal(now) {
+		t.Fatalf("expected stale successful claude identity to be deleted at sync time, got %+v", oldClaude)
+	}
+	if newClaude := byIdentity["new-claude-auth-index"]; newClaude.Identity == "" || newClaude.LookupKey != "new-claude-key" || newClaude.IsDeleted {
+		t.Fatalf("expected new claude identity to be active, got %+v", newClaude)
+	}
+}
+
+func TestSyncMetadataAggregatesUsageIdentityStatsAfterUpsert(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	eventTime := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	if _, _, err := repository.InsertUsageEvents(db, []entities.UsageEvent{{
+		EventKey:     "auth-stat-event",
+		AuthType:     "oauth",
+		AuthIndex:    "auth-stat",
+		Model:        "sonnet",
+		Timestamp:    eventTime,
+		InputTokens:  11,
+		OutputTokens: 13,
+		TotalTokens:  24,
+	}}); err != nil {
+		t.Fatalf("seed usage event: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		Now:     func() time.Time { return now },
+		MetadataFetcher: stubMetadataFetcher{authFilesResult: &response.AuthFilesResult{StatusCode: 200, Payload: authfiles.AuthFilesResponse{Files: []authfiles.AuthFile{{
+			AuthIndex: "auth-stat",
+			Email:     "stats@example.com",
+			Type:      "claude",
+			Provider:  "Claude",
+		}}}}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	var identity entities.UsageIdentity
+	if err := db.Where("identity = ?", "auth-stat").First(&identity).Error; err != nil {
+		t.Fatalf("load usage identity: %v", err)
+	}
+	if identity.TotalRequests != 1 || identity.SuccessCount != 1 || identity.InputTokens != 11 || identity.OutputTokens != 13 || identity.TotalTokens != 24 || identity.LastAggregatedUsageEventID == 0 || identity.StatsUpdatedAt == nil || !identity.StatsUpdatedAt.Equal(now) {
+		t.Fatalf("expected usage identity stats aggregated after metadata upsert, got %+v", identity)
+	}
+	if identity.FirstUsedAt == nil || !identity.FirstUsedAt.Equal(eventTime) || identity.LastUsedAt == nil || !identity.LastUsedAt.Equal(eventTime) {
+		t.Fatalf("expected usage identity first/last usage times from seeded event, got %+v", identity)
+	}
+}
+
+func TestSyncMetadataPersistsProviderUsageIdentitiesFromDedicatedEndpoints(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{providerConfig: providerconfig.ProviderMetadataConfig{
+			GeminiAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "gemini-key", Prefix: "gemini-prefix", Name: "Gemini", AuthIndex: "gemini-auth-index"}},
+			ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "claude-key", Prefix: "claude-prefix", Name: "Claude", AuthIndex: "claude-auth-index"}},
+			OpenAICompatibility: []providerconfig.OpenAICompatibilityConfig{{
+				Name:          "Custom OpenAI",
+				Prefix:        "custom-openai",
+				APIKeyEntries: []providerconfig.OpenAIApiKeyEntry{{APIKey: "custom-key", AuthIndex: "custom-auth-index"}},
+			}},
+		}},
+	})
+
+	if err := service.SyncMetadata(context.Background()); err != nil {
+		t.Fatalf("SyncMetadata returned error: %v", err)
+	}
+	items, err := repository.ListUsageIdentities(context.Background(), db)
+	if err != nil {
+		t.Fatalf("list usage identities: %v", err)
+	}
+	providerItems := usageIdentitiesByIdentity(items)
+	expectedMetadata := map[string]struct {
+		lookupKey string
+		prefix    string
+	}{
+		"gemini-auth-index": {lookupKey: "gemini-key", prefix: "gemini-prefix"},
+		"claude-auth-index": {lookupKey: "claude-key", prefix: "claude-prefix"},
+		"custom-auth-index": {lookupKey: "custom-key", prefix: "custom-openai"},
+	}
+	for expected, metadata := range expectedMetadata {
+		identity := providerItems[expected]
+		if identity.Identity != expected || identity.LookupKey != metadata.lookupKey || identity.Prefix != metadata.prefix || identity.AuthType != entities.UsageIdentityAuthTypeAIProvider || identity.AuthTypeName != "apikey" || identity.IsDeleted {
+			t.Fatalf("expected active provider usage identity %q, got %+v", expected, identity)
 		}
 	}
-	if _, ok := lookupKeys["old-claude-key"]; ok {
-		t.Fatalf("expected stale successful claude row to be replaced, got %+v", items)
+	for _, prefix := range []string{"gemini-prefix", "claude-prefix", "custom-openai"} {
+		if _, ok := providerItems[prefix]; ok {
+			t.Fatalf("expected provider prefix %q not to create usage identity, got %+v", prefix, items)
+		}
+	}
+	assertTableNotExists(t, db, "provider_metadata")
+}
+
+func TestSyncMetadataPersistsSuccessfulProviderUsageIdentitiesWhenOneEndpointFails(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		MetadataFetcher: stubMetadataFetcher{
+			providerConfig: providerconfig.ProviderMetadataConfig{ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "claude-key", Prefix: "claude-prefix", Name: "Claude", AuthIndex: "claude-auth-index"}}},
+			geminiErr:      errors.New("gemini unavailable"),
+		},
+	})
+
+	err := service.SyncMetadata(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "gemini unavailable") {
+		t.Fatalf("expected provider metadata warning, got %v", err)
+	}
+	items, listErr := repository.ListUsageIdentities(context.Background(), db)
+	if listErr != nil {
+		t.Fatalf("list usage identities: %v", listErr)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	identity := byIdentity["claude-auth-index"]
+	if identity.Identity != "claude-auth-index" || identity.LookupKey != "claude-key" || identity.Type != "claude" || identity.AuthType != entities.UsageIdentityAuthTypeAIProvider || identity.IsDeleted {
+		t.Fatalf("expected successful provider usage identity to persist, got %+v", identity)
+	}
+	if _, ok := byIdentity["claude-prefix"]; ok {
+		t.Fatalf("expected successful provider prefix not to create usage identity, got %+v", items)
+	}
+	if _, ok := byIdentity["gemini-key"]; ok {
+		t.Fatalf("expected failed gemini endpoint not to create usage identity, got %+v", items)
 	}
 }
 
-func TestSyncMetadataKeepsProviderRowsWhenEndpointReturnsNilResult(t *testing.T) {
+func TestSyncMetadataKeepsFailedProviderUsageIdentitiesDuringPartialFailure(t *testing.T) {
 	db := openSyncTestDatabase(t)
-	if err := repository.ReplaceProviderMetadata(db, []repository.ProviderMetadataInput{{
-		LookupKey:    "old-gemini-key",
-		ProviderType: "gemini",
-		DisplayName:  "Old Gemini",
-		ProviderKey:  "gemini:Old Gemini",
-		MatchKind:    "api_key",
-	}}); err != nil {
-		t.Fatalf("seed provider metadata: %v", err)
+	now := time.Date(2026, 5, 4, 9, 30, 0, 0, time.UTC)
+	if err := db.Create(&[]entities.UsageIdentity{{
+		Name:         "Old Gemini",
+		AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+		AuthTypeName: "apikey",
+		Identity:     "old-gemini-key",
+		Type:         "gemini",
+		Provider:     "Old Gemini",
+	}, {
+		Name:         "Old Claude",
+		AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+		AuthTypeName: "apikey",
+		Identity:     "old-claude-key",
+		Type:         "claude",
+		Provider:     "Old Claude",
+	}}).Error; err != nil {
+		t.Fatalf("seed usage identities: %v", err)
+	}
+	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
+		BaseURL: "https://cpa.example.com",
+		Now:     func() time.Time { return now },
+		MetadataFetcher: stubMetadataFetcher{
+			providerConfig: providerconfig.ProviderMetadataConfig{ClaudeAPIKeys: []providerconfig.ProviderKeyConfig{{APIKey: "new-claude-key", Prefix: "new-claude-prefix", Name: "New Claude", AuthIndex: "new-claude-auth-index"}}},
+			geminiErr:      errors.New("gemini unavailable"),
+		},
+	})
+
+	err := service.SyncMetadata(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "gemini unavailable") {
+		t.Fatalf("expected provider metadata warning, got %v", err)
+	}
+	items, listErr := repository.ListUsageIdentities(context.Background(), db)
+	if listErr != nil {
+		t.Fatalf("list usage identities: %v", listErr)
+	}
+	byIdentity := usageIdentitiesByIdentity(items)
+	if oldGemini := byIdentity["old-gemini-key"]; oldGemini.Identity == "" || oldGemini.IsDeleted || oldGemini.DeletedAt != nil {
+		t.Fatalf("expected failed gemini usage identity to remain untouched, got %+v", oldGemini)
+	}
+	if oldClaude := byIdentity["old-claude-key"]; oldClaude.Identity == "" || !oldClaude.IsDeleted || oldClaude.DeletedAt == nil || !oldClaude.DeletedAt.Equal(now) {
+		t.Fatalf("expected stale successful claude usage identity to be deleted, got %+v", oldClaude)
+	}
+	newClaude := byIdentity["new-claude-auth-index"]
+	if newClaude.Identity != "new-claude-auth-index" || newClaude.LookupKey != "new-claude-key" || newClaude.IsDeleted {
+		t.Fatalf("expected active replacement usage identity, got %+v", newClaude)
+	}
+	if _, ok := byIdentity["new-claude-prefix"]; ok {
+		t.Fatalf("expected replacement prefix not to create usage identity, got %+v", items)
+	}
+}
+
+func TestSyncMetadataKeepsProviderUsageIdentitiesWhenEndpointReturnsNilResult(t *testing.T) {
+	db := openSyncTestDatabase(t)
+	if err := db.Create(&entities.UsageIdentity{
+		Name:         "Old Gemini",
+		AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+		AuthTypeName: "apikey",
+		Identity:     "old-gemini-key",
+		Type:         "gemini",
+		Provider:     "Old Gemini",
+	}).Error; err != nil {
+		t.Fatalf("seed usage identity: %v", err)
 	}
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL:         "https://cpa.example.com",
-		MetadataFetcher: stubExportFetcher{geminiNilResult: true},
+		MetadataFetcher: stubMetadataFetcher{geminiNilResult: true},
 	})
 
 	err := service.SyncMetadata(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "gemini api keys response is nil") {
 		t.Fatalf("expected nil gemini response warning, got %v", err)
 	}
-	items, listErr := repository.ListProviderMetadata(db)
+	items, listErr := repository.ListUsageIdentities(context.Background(), db)
 	if listErr != nil {
-		t.Fatalf("list provider metadata: %v", listErr)
+		t.Fatalf("list usage identities: %v", listErr)
 	}
-	if len(items) != 1 || items[0].LookupKey != "old-gemini-key" {
-		t.Fatalf("expected old gemini metadata to remain, got %+v", items)
+	byIdentity := usageIdentitiesByIdentity(items)
+	oldGemini := byIdentity["old-gemini-key"]
+	if oldGemini.Identity == "" || oldGemini.IsDeleted || oldGemini.DeletedAt != nil {
+		t.Fatalf("expected old gemini usage identity to remain, got %+v", oldGemini)
 	}
 }
 
-func TestSyncRedisBatchErrorDoesNotCreateSnapshot(t *testing.T) {
+func TestSplitRedisUsageSyncErrorDoesNotCreateSnapshot(t *testing.T) {
 	db := openSyncTestDatabase(t)
 	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
 		BaseURL:    "https://cpa.example.com",
 		RedisQueue: staticRedisQueue{err: errors.New("dial failed")},
 	})
 
-	result, err := service.SyncRedisBatch(context.Background(), false)
+	result, err := processPendingOrPulledRedisUsageForTest(t, service)
 	if err == nil || result == nil || result.Status != "failed" {
 		t.Fatalf("expected failed redis batch result, got result=%+v err=%v", result, err)
-	}
-	var snapshotCount int64
-	if countErr := db.Model(&models.SnapshotRun{}).Count(&snapshotCount).Error; countErr != nil {
-		t.Fatalf("count snapshot runs: %v", countErr)
-	}
-	if snapshotCount != 0 {
-		t.Fatalf("expected no snapshot runs after redis pop error, got %d", snapshotCount)
-	}
-}
-
-func TestSyncOnceUsesRedisUsageFetcher(t *testing.T) {
-	db := openSyncTestDatabase(t)
-	service := NewSyncServiceWithOptions(db, SyncServiceOptions{
-		BaseURL:         "https://cpa.example.com",
-		UsageFetcher:    redisUsageFetcher{queue: staticRedisQueue{messages: []string{`{"timestamp":"2026-04-27T08:00:00Z","provider":"claude","model":"sonnet","request_id":"redis-1","tokens":{"input_tokens":1,"output_tokens":2}}`}}},
-		MetadataFetcher: stubExportFetcher{},
-	})
-
-	result, err := service.SyncNow(context.Background())
-	if err != nil {
-		t.Fatalf("SyncNow returned error: %v", err)
-	}
-	if result.InsertedEvents != 1 || result.HTTPStatus != 0 {
-		t.Fatalf("unexpected redis sync result: %+v", result)
-	}
-
-	var event models.UsageEvent
-	if err := db.First(&event).Error; err != nil {
-		t.Fatalf("load usage event: %v", err)
-	}
-	if event.EventKey != "redis-1" || event.APIGroupKey != "claude" || event.Model != "sonnet" {
-		t.Fatalf("unexpected redis usage event: %+v", event)
 	}
 }
 
@@ -1436,9 +1382,6 @@ func TestNewSyncServiceBuildsClientFromConfig(t *testing.T) {
 		CPABaseURL:       " https://cpa.example.com ",
 		CPAManagementKey: "secret",
 		RequestTimeout:   5 * time.Second,
-		BackupEnabled:    true,
-		BackupDir:        "/tmp/backups",
-		BackupInterval:   2 * time.Hour,
 	})
 	if service == nil || service.client == nil {
 		t.Fatal("expected sync service client to be initialized")
@@ -1446,38 +1389,9 @@ func TestNewSyncServiceBuildsClientFromConfig(t *testing.T) {
 	if service.baseURL != "https://cpa.example.com" {
 		t.Fatalf("expected trimmed base url, got %q", service.baseURL)
 	}
-	if service.backupWriter == nil {
-		t.Fatal("expected backup writer to be initialized when backups are enabled")
-	}
-	if service.backupInterval != 2*time.Hour {
-		t.Fatalf("expected backup interval to be initialized, got %s", service.backupInterval)
-	}
 }
 
-func equivalentExportResult(apiGroupKey, model string, timestamp time.Time, source, authIndex string, failed bool, latencyMS int64, tokens cpa.TokenStats) *cpa.ExportResult {
-	return &cpa.ExportResult{
-		StatusCode: 200,
-		Body:       []byte(`{"version":1}`),
-		Payload: cpa.UsageExport{
-			Version:    1,
-			ExportedAt: timestamp.UTC(),
-			Usage: cpa.StatisticsSnapshot{APIs: map[string]cpa.APISnapshot{
-				apiGroupKey: {Models: map[string]cpa.ModelSnapshot{
-					model: {Details: []cpa.RequestDetail{{
-						Timestamp: timestamp,
-						LatencyMS: latencyMS,
-						Source:    source,
-						AuthIndex: authIndex,
-						Failed:    failed,
-						Tokens:    tokens,
-					}}},
-				}},
-			}},
-		},
-	}
-}
-
-func equivalentRedisMessage(apiGroupKey, model string, timestamp time.Time, source, authIndex string, failed bool, latencyMS int64, tokens cpa.TokenStats, requestID string) string {
+func equivalentRedisMessage(apiGroupKey, model string, timestamp time.Time, source, authIndex string, failed bool, latencyMS int64, tokens dto.TokenStats, requestID string) string {
 	failedValue := "false"
 	if failed {
 		failedValue = "true"
@@ -1489,10 +1403,30 @@ func int64String(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
 
+func strPtr(value string) *string {
+	return &value
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func usageIdentitiesByIdentity(items []entities.UsageIdentity) map[string]entities.UsageIdentity {
+	byIdentity := make(map[string]entities.UsageIdentity, len(items))
+	for _, item := range items {
+		byIdentity[item.Identity] = item
+	}
+	return byIdentity
+}
+
 func assertUsageEventCount(t *testing.T, db *gorm.DB, expected int64) {
 	t.Helper()
 	var count int64
-	if err := db.Model(&models.UsageEvent{}).Count(&count).Error; err != nil {
+	if err := db.Model(&entities.UsageEvent{}).Count(&count).Error; err != nil {
 		t.Fatalf("count usage events: %v", err)
 	}
 	if count != expected {
@@ -1500,31 +1434,10 @@ func assertUsageEventCount(t *testing.T, db *gorm.DB, expected int64) {
 	}
 }
 
-func successfulExportResult(body []byte) *cpa.ExportResult {
-	return &cpa.ExportResult{
-		StatusCode: 200,
-		Body:       body,
-		Payload: cpa.UsageExport{
-			Version:    1,
-			ExportedAt: time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC),
-			Usage: cpa.StatisticsSnapshot{
-				APIs: map[string]cpa.APISnapshot{
-					"provider-a": {
-						Models: map[string]cpa.ModelSnapshot{
-							"claude-sonnet": {
-								Details: []cpa.RequestDetail{{
-									Timestamp: time.Date(2026, 4, 16, 9, 30, 0, 0, time.UTC),
-									LatencyMS: 123,
-									Source:    "codex-a",
-									AuthIndex: "1",
-									Tokens:    cpa.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 5, TotalTokens: 35},
-								}},
-							},
-						},
-					},
-				},
-			},
-		},
+func assertTableNotExists(t *testing.T, db *gorm.DB, table string) {
+	t.Helper()
+	if db.Migrator().HasTable(table) {
+		t.Fatalf("expected %s table not to exist", table)
 	}
 }
 
@@ -1535,7 +1448,22 @@ func openSyncTestDatabase(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("OpenDatabase returned error: %v", err)
 	}
+	closeTestDatabase(t, db)
 	return db
+}
+
+func closeTestDatabase(t *testing.T, db *gorm.DB) {
+	t.Helper()
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+	})
 }
 
 func captureSyncDebugLogs(t *testing.T) *bytes.Buffer {
@@ -1569,7 +1497,8 @@ func openSyncTestDatabaseWithLogs(t *testing.T) (*gorm.DB, *bytes.Buffer) {
 	if err != nil {
 		t.Fatalf("gorm.Open returned error: %v", err)
 	}
-	if err := db.AutoMigrate(models.All()...); err != nil {
+	closeTestDatabase(t, db)
+	if err := db.AutoMigrate(entities.All()...); err != nil {
 		t.Fatalf("AutoMigrate returned error: %v", err)
 	}
 	return db, logs

@@ -7,45 +7,42 @@ import (
 	"testing"
 	"time"
 
-	"cpa-usage-keeper/internal/cpa"
-	"cpa-usage-keeper/internal/models"
-	"cpa-usage-keeper/internal/service"
+	"cpa-usage-keeper/internal/auth"
+	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/repository/dto"
+	servicedto "cpa-usage-keeper/internal/service/dto"
 )
 
 type usageFilterStub struct {
-	usage         *cpa.StatisticsSnapshot
-	overview      *service.UsageOverviewSnapshot
+	usage         *dto.StatisticsSnapshot
+	overview      *servicedto.UsageOverviewSnapshot
 	err           error
-	lastFilter    service.UsageFilter
+	lastFilter    servicedto.UsageFilter
 	filterCalls   int
 	overviewCalls int
 }
 
-func (s *usageFilterStub) GetUsageWithFilter(_ context.Context, filter service.UsageFilter) (*cpa.StatisticsSnapshot, error) {
+func (s *usageFilterStub) GetUsageWithFilter(_ context.Context, filter servicedto.UsageFilter) (*dto.StatisticsSnapshot, error) {
 	s.lastFilter = filter
 	s.filterCalls++
 	return s.usage, s.err
 }
 
-func (s *usageFilterStub) GetUsageOverview(_ context.Context, filter service.UsageFilter) (*service.UsageOverviewSnapshot, error) {
+func (s *usageFilterStub) GetUsageOverview(_ context.Context, filter servicedto.UsageFilter) (*servicedto.UsageOverviewSnapshot, error) {
 	s.lastFilter = filter
 	s.overviewCalls++
 	return s.overview, s.err
 }
 
-func (s *usageFilterStub) ListUsageEvents(context.Context, service.UsageFilter) (*service.UsageEventsPage, error) {
+func (s *usageFilterStub) ListUsageEvents(context.Context, servicedto.UsageFilter) (*servicedto.UsageEventsPage, error) {
 	return nil, s.err
 }
 
-func (s *usageFilterStub) ListUsageEventFilterOptions(context.Context, service.UsageFilter) (*service.UsageEventFilterOptions, error) {
+func (s *usageFilterStub) ListUsageEventFilterOptions(context.Context, servicedto.UsageFilter) (*servicedto.UsageEventFilterOptions, error) {
 	return nil, s.err
 }
 
-func (s *usageFilterStub) ListUsageCredentialStats(context.Context, service.UsageFilter) ([]service.UsageCredentialStat, error) {
-	return nil, s.err
-}
-
-func (s *usageFilterStub) GetUsageAnalysis(context.Context, service.UsageFilter) (*service.UsageAnalysisSnapshot, error) {
+func (s *usageFilterStub) GetAnalysis(context.Context, servicedto.UsageFilter) (*servicedto.AnalysisSnapshot, error) {
 	return nil, s.err
 }
 
@@ -58,6 +55,116 @@ func mustParseTime(t *testing.T, value string) time.Time {
 	return parsed
 }
 
+func TestKeyOverviewForcesViewerAPIKeyIDAndReturnsOverview(t *testing.T) {
+	sessions := auth.NewSessionManager(time.Hour)
+	token, _, err := sessions.CreateAPIKeyViewer(42)
+	if err != nil {
+		t.Fatalf("CreateAPIKeyViewer returned error: %v", err)
+	}
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{Usage: &dto.StatisticsSnapshot{TotalRequests: 3}}}
+	keyProvider := &authCPAAPIKeyStub{row: entities.CPAAPIKey{ID: 42, DisplayKey: "sk-*********live"}}
+	config := AuthConfig{Enabled: true, LoginPassword: "secret", SessionTTL: time.Hour}
+	router := NewRouter(nil, nil, provider, nil, config, NewAuthHandler(config, sessions), "", OptionalProviders{CPAAPIKeys: keyProvider})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/key-overview?range=24h&api_key_id=999", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d %s", resp.Code, resp.Body.String())
+	}
+	if provider.lastFilter.APIKeyID != "42" || provider.lastFilter.Range != "24h" {
+		t.Fatalf("expected key overview to force viewer API key id, got %+v", provider.lastFilter)
+	}
+	if !contains(resp.Body.String(), `"total_requests":3`) {
+		t.Fatalf("unexpected response body: %s", resp.Body.String())
+	}
+}
+
+func TestKeyOverviewRejectsCustomAndUnsupportedRanges(t *testing.T) {
+	sessions := auth.NewSessionManager(time.Hour)
+	token, _, err := sessions.CreateAPIKeyViewer(42)
+	if err != nil {
+		t.Fatalf("CreateAPIKeyViewer returned error: %v", err)
+	}
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{}}
+	keyProvider := &authCPAAPIKeyStub{row: entities.CPAAPIKey{ID: 42, DisplayKey: "sk-*********live"}}
+	config := AuthConfig{Enabled: true, LoginPassword: "secret", SessionTTL: time.Hour}
+	router := NewRouter(nil, nil, provider, nil, config, NewAuthHandler(config, sessions), "", OptionalProviders{CPAAPIKeys: keyProvider})
+
+	for _, path := range []string{"/api/v1/key-overview?range=custom&start=2026-04-20&end=2026-04-21", "/api/v1/key-overview?range=90d", "/api/v1/key-overview?start=2026-04-20"} {
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+		router.ServeHTTP(resp, req)
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("expected %s to return 400, got %d %s", path, resp.Code, resp.Body.String())
+		}
+	}
+	if provider.overviewCalls != 0 {
+		t.Fatalf("expected invalid ranges not to call usage provider, got %d", provider.overviewCalls)
+	}
+}
+
+func TestKeyOverviewRateLimitsPerViewerSession(t *testing.T) {
+	sessions := auth.NewSessionManager(time.Hour)
+	token, _, err := sessions.CreateAPIKeyViewer(42)
+	if err != nil {
+		t.Fatalf("CreateAPIKeyViewer returned error: %v", err)
+	}
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{}}
+	keyProvider := &authCPAAPIKeyStub{row: entities.CPAAPIKey{ID: 42, DisplayKey: "sk-*********live"}}
+	config := AuthConfig{Enabled: true, LoginPassword: "secret", SessionTTL: time.Hour}
+	router := NewRouter(nil, nil, provider, nil, config, NewAuthHandler(config, sessions), "", OptionalProviders{CPAAPIKeys: keyProvider})
+
+	for i, expected := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/key-overview?range=24h", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+		router.ServeHTTP(resp, req)
+		if resp.Code != expected {
+			t.Fatalf("request %d expected %d, got %d %s", i+1, expected, resp.Code, resp.Body.String())
+		}
+	}
+}
+
+func TestKeyOverviewClearsInactiveViewerSession(t *testing.T) {
+	sessions := auth.NewSessionManager(time.Hour)
+	token, _, err := sessions.CreateAPIKeyViewer(42)
+	if err != nil {
+		t.Fatalf("CreateAPIKeyViewer returned error: %v", err)
+	}
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{}}
+	keyProvider := &authCPAAPIKeyStub{findErr: context.Canceled}
+	config := AuthConfig{Enabled: true, LoginPassword: "secret", SessionTTL: time.Hour, BasePath: "/cpa"}
+	handler := NewAuthHandler(config, sessions)
+	router := NewRouter(nil, nil, provider, nil, config, handler, "/cpa", OptionalProviders{CPAAPIKeys: keyProvider})
+
+	if !handler.allowKeyOverviewRequest(token) {
+		t.Fatal("expected initial key overview request to be allowed")
+	}
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/cpa/api/v1/key-overview?range=24h", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d %s", resp.Code, resp.Body.String())
+	}
+	if sessions.Validate(token) {
+		t.Fatal("expected inactive viewer session to be deleted")
+	}
+	if _, ok := handler.keyOverviewRequests[token]; ok {
+		t.Fatal("expected inactive key overview cleanup to clear rate limit entry")
+	}
+	cookies := resp.Result().Cookies()
+	if len(cookies) == 0 || cookies[0].Path != "/cpa" || cookies[0].MaxAge >= 0 {
+		t.Fatalf("expected session cookie to be cleared, got %+v", cookies)
+	}
+}
+
 func TestUsageOverviewResponseIncludesResolvedRangeAndTimezone(t *testing.T) {
 	previousLocal := time.Local
 	location, err := time.LoadLocation("Asia/Shanghai")
@@ -67,8 +174,8 @@ func TestUsageOverviewResponseIncludesResolvedRangeAndTimezone(t *testing.T) {
 	t.Cleanup(func() { time.Local = previousLocal })
 	time.Local = location
 
-	provider := &usageFilterStub{overview: &service.UsageOverviewSnapshot{}}
-	router := NewRouter("", nil, provider, nil, nil, nil, AuthConfig{}, nil, "")
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{}}
+	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/overview?range=custom&start=2026-04-20&end=2026-04-21", nil)
 	resp := httptest.NewRecorder()
 
@@ -77,8 +184,8 @@ func TestUsageOverviewResponseIncludesResolvedRangeAndTimezone(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.Code)
 	}
-	expectedStart := time.Date(2026, 4, 20, 0, 0, 0, 0, location).UTC().Format(time.RFC3339Nano)
-	expectedEnd := time.Date(2026, 4, 22, 0, 0, 0, 0, location).Add(-time.Nanosecond).UTC().Format(time.RFC3339Nano)
+	expectedStart := time.Date(2026, 4, 20, 0, 0, 0, 0, location).Format(time.RFC3339Nano)
+	expectedEnd := time.Date(2026, 4, 22, 0, 0, 0, 0, location).Add(-time.Nanosecond).Format(time.RFC3339Nano)
 	body := resp.Body.String()
 	if !contains(body, `"timezone":"Asia/Shanghai"`) || !contains(body, `"range_start":"`+expectedStart+`"`) || !contains(body, `"range_end":"`+expectedEnd+`"`) {
 		t.Fatalf("expected overview response to include resolved range and timezone, got %s", body)
@@ -86,8 +193,8 @@ func TestUsageOverviewResponseIncludesResolvedRangeAndTimezone(t *testing.T) {
 }
 
 func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
-	provider := &usageFilterStub{overview: &service.UsageOverviewSnapshot{
-		Usage: &cpa.StatisticsSnapshot{
+	provider := &usageFilterStub{overview: &servicedto.UsageOverviewSnapshot{
+		Usage: &dto.StatisticsSnapshot{
 			TotalRequests: 1,
 			SuccessCount:  1,
 			TotalTokens:   20,
@@ -97,12 +204,12 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 			TokensByHour: map[string]int64{
 				"2026-04-22T11:00:00Z": 20,
 			},
-			APIs: map[string]cpa.APISnapshot{
+			APIs: map[string]dto.APISnapshot{
 				"provider-a": {
 					TotalRequests: 1,
 					SuccessCount:  1,
 					TotalTokens:   20,
-					Models: map[string]cpa.ModelSnapshot{
+					Models: map[string]dto.ModelSnapshot{
 						"claude-sonnet": {
 							TotalRequests: 1,
 							SuccessCount:  1,
@@ -112,22 +219,18 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 				},
 			},
 		},
-		Summary: service.UsageOverviewSummary{
-			RequestCount:     1,
-			TokenCount:       20,
-			FreshInputTokens: 9,
-			OutputTokens:     7,
-			RealTotalTokens:  18,
-			CacheHitRate:     2.0 / 11.0,
-			WindowMinutes:    1440,
-			RPM:              1.0 / 1440.0,
-			TPM:              20.0 / 1440.0,
-			TotalCost:        0.123,
-			CostAvailable:    true,
-			CachedTokens:     2,
-			ReasoningTokens:  3,
+		Summary: servicedto.UsageOverviewSummary{
+			RequestCount:    1,
+			TokenCount:      20,
+			WindowMinutes:   1440,
+			RPM:             1.0 / 1440.0,
+			TPM:             20.0 / 1440.0,
+			TotalCost:       0.123,
+			CostAvailable:   true,
+			CachedTokens:    2,
+			ReasoningTokens: 3,
 		},
-		Series: service.UsageOverviewSeries{
+		Series: servicedto.UsageOverviewSeries{
 			Requests:        map[string]int64{"2026-04-22T11:00:00Z": 1},
 			Tokens:          map[string]int64{"2026-04-22T11:00:00Z": 20},
 			RPM:             map[string]float64{"2026-04-22T11:00:00Z": 1.0 / 60.0},
@@ -138,11 +241,11 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 			CachedTokens:    map[string]int64{"2026-04-22T11:00:00Z": 2},
 			ReasoningTokens: map[string]int64{"2026-04-22T11:00:00Z": 3},
 		},
-		Health: service.UsageOverviewHealth{
+		Health: servicedto.UsageOverviewHealth{
 			TotalSuccess: 1,
 			TotalFailure: 0,
 			SuccessRate:  100,
-			BlockDetails: []service.UsageOverviewHealthBlock{{
+			BlockDetails: []servicedto.UsageOverviewHealthBlock{{
 				StartTime: mustParseTime(t, "2026-04-22T11:00:00Z"),
 				EndTime:   mustParseTime(t, "2026-04-22T11:15:00Z"),
 				Success:   1,
@@ -151,7 +254,7 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 			}},
 		},
 	}}
-	router := NewRouter("", nil, provider, authFileStub{files: []models.AuthFile{{AuthIndex: "2", Email: "user@example.com", Type: "auth-file"}}}, nil, nil, AuthConfig{}, nil, "")
+	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/overview?range=24h", nil)
 	resp := httptest.NewRecorder()
 
@@ -166,12 +269,6 @@ func TestUsageOverviewReturnsFilteredSnapshot(t *testing.T) {
 	}
 	if !contains(body, `"summary":{"request_count":1,"token_count":20`) {
 		t.Fatalf("expected backend summary in response body: %s", body)
-	}
-	if !contains(body, `"fresh_input_tokens":9`) ||
-		!contains(body, `"output_tokens":7`) ||
-		!contains(body, `"real_total_tokens":18`) ||
-		!contains(body, `"cache_hit_rate":0.18181818181818182`) {
-		t.Fatalf("expected real token counters in response body: %s", body)
 	}
 	if !contains(body, `"cost_available":true`) {
 		t.Fatalf("expected backend cost availability in response body: %s", body)

@@ -3,59 +3,58 @@ package api
 import (
 	"bytes"
 	"context"
-	"errors"
+	"io"
+	"io/fs"
 	"net/http"
-	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"cpa-usage-keeper/internal/poller"
+	"cpa-usage-keeper/internal/quota"
 	"cpa-usage-keeper/internal/service"
+	"cpa-usage-keeper/internal/timeutil"
+	"cpa-usage-keeper/internal/updatecheck"
+	"cpa-usage-keeper/internal/version"
 	"github.com/gin-gonic/gin"
 )
 
 const appBasePathPlaceholder = "__APP_BASE_PATH__"
-const manualSyncRateLimitWindow = time.Second
-
-type syncLimiter struct {
-	mu       sync.Mutex
-	window   time.Duration
-	lastSync time.Time
-}
-
-func (l *syncLimiter) allow(now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if !l.lastSync.IsZero() && now.Sub(l.lastSync) < l.window {
-		return false
-	}
-	l.lastSync = now
-	return true
-}
 
 type StatusProvider interface {
 	Status() poller.Status
 }
 
-type SyncRunner interface {
-	SyncNow(ctx context.Context) error
+type QuotaProvider interface {
+	GetCachedQuota(context.Context, quota.CacheRequest) (quota.CacheResponse, error)
+	Refresh(context.Context, quota.RefreshRequest) (quota.RefreshResponse, error)
+	GetRefreshTask(context.Context, string) (quota.RefreshTaskResponse, error)
+}
+
+type StatusRouteConfig struct {
+	CPAPublicURL string
+}
+
+type OptionalProviders struct {
+	UsageIdentity service.UsageIdentityProvider
+	Quota         QuotaProvider
+	CPAAPIKeys    service.CPAAPIKeyProvider
+	Status        StatusRouteConfig
 }
 
 func NewRouter(
-	staticDir string,
+	staticFS fs.FS,
 	statusProvider StatusProvider,
 	usageProvider service.UsageProvider,
-	authFileProvider service.AuthFileProvider,
-	providerMetadataProvider service.ProviderMetadataProvider,
 	pricingProvider service.PricingProvider,
 	authConfig AuthConfig,
 	authHandler *authHandler,
 	basePath string,
+	optionalProviders ...OptionalProviders,
 ) *gin.Engine {
 	router := gin.New()
+	_ = router.SetTrustedProxies(nil)
 	router.Use(gin.Recovery())
 
 	appGroup := router.Group(basePath)
@@ -72,32 +71,61 @@ func NewRouter(
 	}
 	authHandler.registerRoutes(authGroup)
 
-	protected := apiV1.Group("")
-	protected.Use(authHandler.middleware())
-	registerStatusRoutes(protected, statusProvider)
-	registerSyncRoutes(protected, statusProvider, &syncLimiter{window: manualSyncRateLimitWindow})
-	registerUsageOverviewRoute(protected, usageProvider)
-	registerUsageAnalysisRoute(protected, usageProvider)
-	registerUsageEventsRoute(protected, usageProvider, authFileProvider, providerMetadataProvider)
-	registerUsageCredentialsRoute(protected, usageProvider, authFileProvider, providerMetadataProvider)
-	registerAuthFileRoutes(protected, authFileProvider)
-	registerProviderMetadataRoutes(protected, providerMetadataProvider)
-	registerPricingRoutes(protected, pricingProvider)
+	var usageIdentityProvider service.UsageIdentityProvider
+	var quotaProvider QuotaProvider
+	var cpaAPIKeyProvider service.CPAAPIKeyProvider
+	var statusConfig StatusRouteConfig
+	if len(optionalProviders) > 0 {
+		usageIdentityProvider = optionalProviders[0].UsageIdentity
+		quotaProvider = optionalProviders[0].Quota
+		cpaAPIKeyProvider = optionalProviders[0].CPAAPIKeys
+		statusConfig = optionalProviders[0].Status
+	}
+	authHandler.setCPAAPIKeyProvider(cpaAPIKeyProvider)
 
-	if staticDir != "" {
-		if info, err := os.Stat(staticDir); err == nil && info.IsDir() {
-			indexPath := filepath.Join(staticDir, "index.html")
+	adminProtected := apiV1.Group("")
+	adminProtected.Use(authHandler.adminMiddleware())
+	registerStatusRoutes(adminProtected, statusProvider, statusConfig)
+	registerUpdateRoutes(adminProtected, nil)
+	registerUsageOverviewRoute(adminProtected, usageProvider)
+	registerUsageAnalysisRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
+	registerUsageEventsRoute(adminProtected, usageProvider, usageIdentityProvider)
+	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
+	registerCPAAPIKeyRoutes(adminProtected, cpaAPIKeyProvider)
+	registerPricingRoutes(adminProtected, pricingProvider)
+	registerQuotaRoutes(adminProtected, quotaProvider)
+
+	keyViewerProtected := apiV1.Group("")
+	keyViewerProtected.Use(authHandler.apiKeyViewerMiddleware())
+	registerKeyOverviewRoute(keyViewerProtected, usageProvider, cpaAPIKeyProvider, authHandler)
+
+	if staticFS != nil {
+		if indexFile, err := staticFS.Open("index.html"); err == nil {
+			_ = indexFile.Close()
+			httpFS := http.FS(staticFS)
 			serveIndex := func(c *gin.Context) {
-				indexHTML, err := renderIndexHTML(indexPath, basePath)
+				indexHTML, err := renderIndexHTML(staticFS, basePath)
 				if err != nil {
 					c.Status(http.StatusNotFound)
 					return
 				}
+				setHTMLCacheHeaders(c)
 				c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
+			}
+			serveAsset := func(c *gin.Context) {
+				assetPath := "assets/" + strings.TrimPrefix(c.Param("filepath"), "/")
+				if assetFile, err := staticFS.Open(assetPath); err == nil {
+					_ = assetFile.Close()
+					setStaticAssetCacheHeaders(c)
+					c.FileFromFS(assetPath, httpFS)
+					return
+				}
+				c.Status(http.StatusNotFound)
 			}
 
 			appGroup.GET("/", serveIndex)
-			appGroup.Static("/assets", filepath.Join(staticDir, "assets"))
+			appGroup.GET("/assets/*filepath", serveAsset)
+			appGroup.HEAD("/assets/*filepath", serveAsset)
 			router.NoRoute(func(c *gin.Context) {
 				requestPath, ok := stripBasePath(basePath, c.Request.URL.Path)
 				if !ok {
@@ -109,11 +137,11 @@ func NewRouter(
 					return
 				}
 
-				relPath := strings.TrimPrefix(filepath.Clean(requestPath), "/")
-				if relPath != "." && relPath != "" {
-					assetPath := filepath.Join(staticDir, relPath)
-					if assetInfo, err := os.Stat(assetPath); err == nil && !assetInfo.IsDir() {
-						c.File(assetPath)
+				if assetPath, ok := staticAssetPath(requestPath); ok {
+					if assetFile, err := staticFS.Open(assetPath); err == nil {
+						_ = assetFile.Close()
+						setStaticAssetCacheHeaders(c)
+						c.FileFromFS(assetPath, httpFS)
 						return
 					}
 				}
@@ -126,8 +154,23 @@ func NewRouter(
 	return router
 }
 
-func renderIndexHTML(indexPath, basePath string) ([]byte, error) {
-	indexHTML, err := os.ReadFile(indexPath)
+func setHTMLCacheHeaders(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+}
+
+func setStaticAssetCacheHeaders(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+}
+
+func renderIndexHTML(staticFS fs.FS, basePath string) ([]byte, error) {
+	indexFile, err := staticFS.Open("index.html")
+	if err != nil {
+		return nil, err
+	}
+	defer indexFile.Close()
+	indexHTML, err := io.ReadAll(indexFile)
 	if err != nil {
 		return nil, err
 	}
@@ -139,14 +182,31 @@ func renderIndexHTML(indexPath, basePath string) ([]byte, error) {
 	), nil
 }
 
-func stripBasePath(basePath, requestPath string) (string, bool) {
-	cleaned := filepath.Clean(requestPath)
+func cleanURLPath(requestPath string) string {
+	cleaned := path.Clean(requestPath)
 	if cleaned == "." {
-		cleaned = "/"
+		return "/"
 	}
 	if !strings.HasPrefix(cleaned, "/") {
-		cleaned = "/" + cleaned
+		return "/" + cleaned
 	}
+	return cleaned
+}
+
+func staticAssetPath(requestPath string) (string, bool) {
+	cleaned := cleanURLPath(requestPath)
+	if strings.Contains(cleaned, "\\") {
+		return "", false
+	}
+	relPath := strings.TrimPrefix(cleaned, "/")
+	if relPath == "" {
+		return "", false
+	}
+	return relPath, true
+}
+
+func stripBasePath(basePath, requestPath string) (string, bool) {
+	cleaned := cleanURLPath(requestPath)
 	if basePath == "" {
 		return cleaned, true
 	}
@@ -164,69 +224,43 @@ func stripBasePath(basePath, requestPath string) (string, bool) {
 }
 
 type statusResponse struct {
-	Running     bool       `json:"running"`
-	SyncRunning bool       `json:"sync_running"`
-	Timezone    string     `json:"timezone"`
-	LastRunAt   *time.Time `json:"last_run_at,omitempty"`
-	LastError   string     `json:"last_error,omitempty"`
-	LastWarning string     `json:"last_warning,omitempty"`
-	LastStatus  string     `json:"last_status,omitempty"`
+	Running            bool       `json:"running"`
+	SyncRunning        bool       `json:"sync_running"`
+	Timezone           string     `json:"timezone"`
+	Version            string     `json:"version"`
+	UpdateCheckEnabled bool       `json:"updateCheckEnabled"`
+	CPAPublicURL       string     `json:"cpa_public_url,omitempty"`
+	LastRunAt          *time.Time `json:"last_run_at,omitempty"`
+	LastError          string     `json:"last_error,omitempty"`
+	LastWarning        string     `json:"last_warning,omitempty"`
+	LastStatus         string     `json:"last_status,omitempty"`
 }
 
-func registerStatusRoutes(router gin.IRoutes, statusProvider StatusProvider) {
+func registerStatusRoutes(router gin.IRoutes, statusProvider StatusProvider, config StatusRouteConfig) {
 	router.GET("/status", func(c *gin.Context) {
 		if statusProvider == nil {
-			c.JSON(http.StatusOK, statusResponse{Timezone: time.Local.String()})
+			c.JSON(http.StatusOK, buildStatusResponse(poller.Status{}, config))
 			return
 		}
 
-		c.JSON(http.StatusOK, buildStatusResponse(statusProvider.Status()))
+		c.JSON(http.StatusOK, buildStatusResponse(statusProvider.Status(), config))
 	})
 }
 
-func registerSyncRoutes(router gin.IRoutes, statusProvider StatusProvider, limiter *syncLimiter) {
-	router.POST("/sync", func(c *gin.Context) {
-		if limiter != nil && !limiter.allow(time.Now()) {
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "sync rate limit exceeded"})
-			return
-		}
-
-		syncRunner, ok := statusProvider.(SyncRunner)
-		if !ok || syncRunner == nil {
-			writeInternalError(c, "sync runner is not configured", nil)
-			return
-		}
-
-		if err := syncRunner.SyncNow(c.Request.Context()); err != nil {
-			if errors.Is(err, poller.ErrSyncAlreadyRunning) {
-				c.JSON(http.StatusConflict, gin.H{"error": "sync already running"})
-				return
-			}
-			if !errors.Is(err, poller.ErrSyncCompletedWithWarnings) {
-				writeInternalError(c, "manual sync failed", err)
-				return
-			}
-		}
-
-		if statusProvider, ok := syncRunner.(StatusProvider); ok {
-			c.JSON(http.StatusOK, buildStatusResponse(statusProvider.Status()))
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"sync_running": false})
-	})
-}
-
-func buildStatusResponse(status poller.Status) statusResponse {
+func buildStatusResponse(status poller.Status, config StatusRouteConfig) statusResponse {
 	response := statusResponse{
-		Running:     status.Running,
-		SyncRunning: status.SyncRunning,
-		Timezone:    time.Local.String(),
-		LastError:   status.LastError,
-		LastWarning: status.LastWarning,
-		LastStatus:  status.LastStatus,
+		Running:            status.Running,
+		SyncRunning:        status.SyncRunning,
+		Timezone:           time.Local.String(),
+		Version:            version.Version,
+		UpdateCheckEnabled: updatecheck.IsStableVersion(version.Version),
+		CPAPublicURL:       config.CPAPublicURL,
+		LastError:          status.LastError,
+		LastWarning:        status.LastWarning,
+		LastStatus:         status.LastStatus,
 	}
 	if !status.LastRunAt.IsZero() {
-		lastRunAt := status.LastRunAt.UTC()
+		lastRunAt := timeutil.NormalizeStorageTime(status.LastRunAt)
 		response.LastRunAt = &lastRunAt
 	}
 	return response

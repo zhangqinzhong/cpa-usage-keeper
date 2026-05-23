@@ -7,7 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"cpa-usage-keeper/internal/service"
+	servicedto "cpa-usage-keeper/internal/service/dto"
+	"cpa-usage-keeper/internal/timeutil"
 )
 
 var presetUsageRangeDurations = map[string]time.Duration{
@@ -16,6 +17,7 @@ var presetUsageRangeDurations = map[string]time.Duration{
 	"12h": 12 * time.Hour,
 	"24h": 24 * time.Hour,
 	"7d":  7 * 24 * time.Hour,
+	"30d": 30 * 24 * time.Hour,
 }
 
 var allowedUsageEventsPageSizes = map[int]struct{}{
@@ -26,10 +28,10 @@ var allowedUsageEventsPageSizes = map[int]struct{}{
 	1000: {},
 }
 
-func parseUsageTimeFilterQuery(req *http.Request, anchor time.Time) (service.UsageFilter, error) {
+func parseUsageTimeFilterQuery(req *http.Request, anchor time.Time) (servicedto.UsageFilter, error) {
 	filter, err := parseUsageFilterQuery(req, anchor)
 	if err != nil {
-		return service.UsageFilter{}, err
+		return servicedto.UsageFilter{}, err
 	}
 	filter.Limit = 0
 	filter.Page = 0
@@ -52,22 +54,22 @@ func parseCustomUsageRangeBoundary(value string, endOfDay bool) (time.Time, erro
 	return time.Parse(time.RFC3339, value)
 }
 
-func parseUsageFilterQuery(req *http.Request, anchor time.Time) (service.UsageFilter, error) {
+func parseUsageFilterQuery(req *http.Request, anchor time.Time) (servicedto.UsageFilter, error) {
 	if req == nil {
-		return service.UsageFilter{}, nil
+		return servicedto.UsageFilter{}, nil
 	}
 
 	rangeValue := strings.TrimSpace(req.URL.Query().Get("range"))
 	if rangeValue == "" {
-		rangeValue = "all"
+		return servicedto.UsageFilter{}, fmt.Errorf("usage range is required")
 	}
 
-	filter := service.UsageFilter{Range: rangeValue, Limit: service.DefaultUsageEventsLimit, Page: 1, PageSize: service.DefaultUsageEventsLimit}
+	filter := servicedto.UsageFilter{Range: rangeValue, Limit: servicedto.DefaultUsageEventsLimit, Page: 1, PageSize: servicedto.DefaultUsageEventsLimit}
 	query := req.URL.Query()
 	if pageValue := strings.TrimSpace(query.Get("page")); pageValue != "" {
 		page, err := strconv.Atoi(pageValue)
 		if err != nil || page < 1 {
-			return service.UsageFilter{}, fmt.Errorf("invalid page %q", pageValue)
+			return servicedto.UsageFilter{}, fmt.Errorf("invalid page %q", pageValue)
 		}
 		filter.Page = page
 	}
@@ -78,10 +80,10 @@ func parseUsageFilterQuery(req *http.Request, anchor time.Time) (service.UsageFi
 	if pageSizeValue != "" {
 		pageSize, err := strconv.Atoi(pageSizeValue)
 		if err != nil {
-			return service.UsageFilter{}, fmt.Errorf("invalid page_size %q", pageSizeValue)
+			return servicedto.UsageFilter{}, fmt.Errorf("invalid page_size %q", pageSizeValue)
 		}
 		if _, ok := allowedUsageEventsPageSizes[pageSize]; !ok {
-			return service.UsageFilter{}, fmt.Errorf("invalid page_size %q", pageSizeValue)
+			return servicedto.UsageFilter{}, fmt.Errorf("invalid page_size %q", pageSizeValue)
 		}
 		filter.PageSize = pageSize
 		filter.Limit = pageSize
@@ -90,18 +92,20 @@ func parseUsageFilterQuery(req *http.Request, anchor time.Time) (service.UsageFi
 	filter.Model = strings.TrimSpace(query.Get("model"))
 	filter.Source = strings.TrimSpace(query.Get("source"))
 	filter.AuthIndex = strings.TrimSpace(query.Get("auth_index"))
+	filter.APIKeyID = strings.TrimSpace(query.Get("api_key_id"))
 	filter.Result = strings.TrimSpace(query.Get("result"))
 	if filter.Result != "" && filter.Result != "success" && filter.Result != "failed" {
-		return service.UsageFilter{}, fmt.Errorf("invalid result %q", filter.Result)
+		return servicedto.UsageFilter{}, fmt.Errorf("invalid result %q", filter.Result)
 	}
 	switch rangeValue {
-	case "all":
-		return filter, nil
-	case "today":
-		localAnchor := anchor.In(time.Local)
+	case "today", "yesterday":
+		localAnchor := timeutil.NormalizeStorageTime(anchor)
 		localStart := time.Date(localAnchor.Year(), localAnchor.Month(), localAnchor.Day(), 0, 0, 0, 0, time.Local)
-		startTime := localStart.UTC()
-		endTime := localStart.AddDate(0, 0, 1).Add(-time.Nanosecond).UTC()
+		if rangeValue == "yesterday" {
+			localStart = localStart.AddDate(0, 0, -1)
+		}
+		startTime := timeutil.NormalizeStorageTime(localStart)
+		endTime := timeutil.NormalizeStorageTime(localStart.AddDate(0, 0, 1).Add(-time.Nanosecond))
 		filter.StartTime = &startTime
 		filter.EndTime = &endTime
 		return filter, nil
@@ -109,20 +113,20 @@ func parseUsageFilterQuery(req *http.Request, anchor time.Time) (service.UsageFi
 		startValue := strings.TrimSpace(req.URL.Query().Get("start"))
 		endValue := strings.TrimSpace(req.URL.Query().Get("end"))
 		if startValue == "" || endValue == "" {
-			return service.UsageFilter{}, fmt.Errorf("custom range requires start and end")
+			return servicedto.UsageFilter{}, fmt.Errorf("custom range requires start and end")
 		}
 		startTime, err := parseCustomUsageRangeBoundary(startValue, false)
 		if err != nil {
-			return service.UsageFilter{}, fmt.Errorf("invalid start: %w", err)
+			return servicedto.UsageFilter{}, fmt.Errorf("invalid start: %w", err)
 		}
 		endTime, err := parseCustomUsageRangeBoundary(endValue, true)
 		if err != nil {
-			return service.UsageFilter{}, fmt.Errorf("invalid end: %w", err)
+			return servicedto.UsageFilter{}, fmt.Errorf("invalid end: %w", err)
 		}
-		startTime = startTime.UTC()
-		endTime = endTime.UTC()
+		startTime = timeutil.NormalizeStorageTime(startTime)
+		endTime = timeutil.NormalizeStorageTime(endTime)
 		if startTime.After(endTime) {
-			return service.UsageFilter{}, fmt.Errorf("custom range start must be before end")
+			return servicedto.UsageFilter{}, fmt.Errorf("custom range start must be before end")
 		}
 		filter.StartTime = &startTime
 		filter.EndTime = &endTime
@@ -130,10 +134,10 @@ func parseUsageFilterQuery(req *http.Request, anchor time.Time) (service.UsageFi
 	default:
 		duration, ok := presetUsageRangeDurations[rangeValue]
 		if !ok {
-			return service.UsageFilter{}, fmt.Errorf("unsupported usage range %q", rangeValue)
+			return servicedto.UsageFilter{}, fmt.Errorf("unsupported usage range %q", rangeValue)
 		}
-		endTime := anchor.UTC()
-		startTime := endTime.Add(-duration)
+		endTime := timeutil.NormalizeStorageTime(anchor)
+		startTime := timeutil.NormalizeStorageTime(endTime.Add(-duration))
 		filter.StartTime = &startTime
 		filter.EndTime = &endTime
 		return filter, nil
